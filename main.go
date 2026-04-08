@@ -80,6 +80,9 @@ var modelLicenseMap map[string]LicenseMapping
 // Global database connection pool
 var db *sql.DB
 
+// isCloudSaaS determines if the server is running in managed cloud mode
+var isCloudSaaS bool
+
 //go:embed libraries.json models.json licenses.json
 var embeddedFiles embed.FS
 
@@ -168,6 +171,7 @@ func main() {
 	// Connect to Supabase
 	dbURL := os.Getenv("SUPABASE_DB_URL")
 	if dbURL != "" {
+		isCloudSaaS = true
 		var err error
 		db, err = sql.Open("postgres", dbURL)
 		if err != nil {
@@ -233,7 +237,7 @@ func main() {
 	http.HandleFunc("/api/save-proof", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 
 		if r.Method == "OPTIONS" {
 			return
@@ -242,6 +246,22 @@ func main() {
 		if db == nil {
 			http.Error(w, "Database not configured", http.StatusInternalServerError)
 			return
+		}
+
+		// Phase 7: API Key Authentication for Cloud SaaS
+		if isCloudSaaS {
+			authHeader := r.Header.Get("Authorization")
+			if authHeader == "" || !strings.HasPrefix(authHeader, "Bearer ") {
+				http.Error(w, "Unauthorized: Missing or malformed API Key", http.StatusUnauthorized)
+				return
+			}
+			apiKey := strings.TrimPrefix(authHeader, "Bearer ")
+			var userID string
+			err := db.QueryRow("SELECT user_id FROM api_keys WHERE token = $1", apiKey).Scan(&userID)
+			if err != nil {
+				http.Error(w, "Unauthorized: Invalid API Key", http.StatusUnauthorized)
+				return
+			}
 		}
 
 		var bom AIBOM
