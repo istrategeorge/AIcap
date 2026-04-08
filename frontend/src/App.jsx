@@ -10,6 +10,8 @@ const defaultScanData = {
   finOps: []
 };
 
+const API_BASE_URL = import.meta.env.VITE_API_URL || "http://localhost:8080";
+
 export default function App() {
   const [scanData, setScanData] = useState(defaultScanData);
   const [historyData, setHistoryData] = useState([]);
@@ -24,7 +26,7 @@ export default function App() {
   // Fetch DB status on load
   const fetchDbStatus = async () => {
     try {
-      const response = await fetch("http://localhost:8080/api/db-config");
+      const response = await fetch(`${API_BASE_URL}/api/db-config`);
       const data = await response.json();
       setDbConfig(prev => ({ ...prev, enabled: data.connected, connected: data.connected }));
       if (data.connected) fetchHistoryData();
@@ -36,7 +38,7 @@ export default function App() {
   // Fetch historical proof drills
   const fetchHistoryData = async () => {
     try {
-      const response = await fetch("http://localhost:8080/api/history");
+      const response = await fetch(`${API_BASE_URL}/api/history`);
       if (!response.ok) return;
       const data = await response.json();
       setHistoryData(data || []);
@@ -49,7 +51,7 @@ export default function App() {
   const fetchScanData = async () => {
     setIsScanning(true);
     try {
-      const response = await fetch("http://localhost:8080/api/scan");
+      const response = await fetch(`${API_BASE_URL}/api/scan`);
       const data = await response.json();
       setScanData(data);
     } catch (error) {
@@ -68,7 +70,7 @@ export default function App() {
 
   const fetchHistoricalProof = async (hash) => {
     try {
-      const response = await fetch(`http://localhost:8080/api/proof?hash=${hash}`);
+      const response = await fetch(`${API_BASE_URL}/api/proof?hash=${hash}`);
       if (response.ok) {
         const data = await response.json();
         setHistoricalProof({ hash, markdown: data.markdown });
@@ -85,7 +87,7 @@ export default function App() {
     try {
       if (dbConfig.connected) {
         // Send current state to the Go backend to store in Supabase
-        const response = await fetch("http://localhost:8080/api/save-proof", {
+        const response = await fetch(`${API_BASE_URL}/api/save-proof`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(scanData)
@@ -187,7 +189,7 @@ ${scanData.dependencies.map(d => `- **${d.name}** (v${d.version}): ${d.descripti
               <button 
                 onClick={async () => {
                   if (dbConfig.enabled) {
-                    await fetch("http://localhost:8080/api/db-config", {
+                    await fetch(`${API_BASE_URL}/api/db-config`, {
                       method: "POST",
                       headers: { "Content-Type": "application/json" },
                       body: JSON.stringify({ enabled: false })
@@ -219,7 +221,7 @@ ${scanData.dependencies.map(d => `- **${d.name}** (v${d.version}): ${d.descripti
                     setDbConnecting(true);
                     setDbError("");
                     try {
-                      const res = await fetch("http://localhost:8080/api/db-config", {
+                    const res = await fetch(`${API_BASE_URL}/api/db-config`, {
                         method: "POST",
                         headers: { "Content-Type": "application/json" },
                         body: JSON.stringify({ enabled: true, url: dbConfig.url })

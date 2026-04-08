@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/sha256"
 	"database/sql"
 	"embed"
@@ -132,6 +133,24 @@ func main() {
 		bomJSON, _ := json.MarshalIndent(bom, "", "  ")
 		fmt.Println(string(bomJSON))
 
+		// Phase 7: Sync to SaaS if Pro API Key is present
+		apiKey := os.Getenv("AICAP_API_KEY")
+		if apiKey != "" {
+			fmt.Println("\n[+] Pro API Key detected. Syncing AI-BOM and Proof Drill to AIcap Cloud...")
+			req, err := http.NewRequest("POST", "https://api.aicap.dev/v1/save-proof", bytes.NewBuffer(bomJSON))
+			if err == nil {
+				req.Header.Set("Content-Type", "application/json")
+				req.Header.Set("Authorization", "Bearer "+apiKey)
+				client := &http.Client{Timeout: 10 * time.Second}
+				resp, err := client.Do(req)
+				if err != nil || resp.StatusCode != 201 {
+					fmt.Println("[-] Warning: Failed to sync with AIcap Cloud (Is the server reachable?).")
+				} else {
+					fmt.Println("[+] Successfully synced Immutable Proof Drill to your dashboard!")
+				}
+			}
+		}
+
 		if bom.Compliance != "Passed" {
 			fmt.Println("\n[!] Compliance scan failed. High-risk dependencies detected without active mitigation. Blocking pipeline.")
 			os.Exit(1)
@@ -140,7 +159,11 @@ func main() {
 		os.Exit(0)
 	}
 
-	fmt.Println("Starting Continuous AI-BOM Server on :8080...")
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+	fmt.Println("Starting Continuous AI-BOM Server on :" + port + "...")
 
 	// Connect to Supabase
 	dbURL := os.Getenv("SUPABASE_DB_URL")
@@ -316,7 +339,7 @@ func main() {
 		json.NewEncoder(w).Encode(map[string]string{"markdown": markdown})
 	})
 
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	log.Fatal(http.ListenAndServe(":"+port, nil))
 }
 
 // generateAnnexIVMarkdown creates a dynamic markdown template based on the AI-BOM

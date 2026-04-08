@@ -11,8 +11,8 @@ inputs:
     description: "The directory to scan for AI dependencies"
     required: false
     default: "."
-  supabase-url:
-    description: "Optional: Supabase DB URL to persist the Immutable Proof Drill"
+  api-key:
+    description: "Pro Tier: Your AIcap API Key to sync results to your dashboard"
     required: false
 
 runs:
@@ -28,7 +28,7 @@ runs:
     - name: Execute AI-BOM Scan
       shell: bash
       env:
-        SUPABASE_DB_URL: ${{ inputs.supabase-url }}
+        AICAP_API_KEY: ${{ inputs.api-key }}
       run: |
         echo "🔍 Starting Continuous AI-BOM Scan on directory: ${{ inputs.scan-directory }}"
         ./aicap --cli
