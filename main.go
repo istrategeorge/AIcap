@@ -137,7 +137,7 @@ func main() {
 		apiKey := os.Getenv("AICAP_API_KEY")
 		if apiKey != "" {
 			fmt.Println("\n[+] Pro API Key detected. Syncing AI-BOM and Proof Drill to AIcap Cloud...")
-			req, err := http.NewRequest("POST", "https://api.aicap.dev/v1/save-proof", bytes.NewBuffer(bomJSON))
+			req, err := http.NewRequest("POST", "https://aicap.onrender.com/api/save-proof", bytes.NewBuffer(bomJSON))
 			if err == nil {
 				req.Header.Set("Content-Type", "application/json")
 				req.Header.Set("Authorization", "Bearer "+apiKey)
