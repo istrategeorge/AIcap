@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from "react";
 import { Shield, AlertTriangle, FileText, CheckCircle, Database, Server, RefreshCw, History, Download, DollarSign, Key, LogOut } from 'lucide-react';
+import { createClient } from '@supabase/supabase-js';
 
 // Default state before fetch
 const defaultScanData = {
@@ -12,6 +13,12 @@ const defaultScanData = {
 
 const API_BASE_URL = import.meta.env.VITE_API_URL || "http://localhost:8080";
 const IS_CLOUD_SAAS = API_BASE_URL !== "http://localhost:8080";
+
+// Initialize Supabase Client
+const supabase = createClient(
+  import.meta.env.VITE_SUPABASE_URL || "https://placeholder.supabase.co",
+  import.meta.env.VITE_SUPABASE_ANON_KEY || "placeholder"
+);
 
 export default function App() {
   const [scanData, setScanData] = useState(defaultScanData);
@@ -120,20 +127,47 @@ export default function App() {
   };
 
   // Handle User Login/Signup
-  const handleAuth = (e) => {
+  const handleAuth = async (e) => {
     e.preventDefault();
     setAuthForm({ ...authForm, loading: true });
     
-    // MVP Simulation: In production, this is replaced by supabase.auth.signInWithPassword()
-    setTimeout(() => {
-      setSession({
-        user: { email: authForm.email },
-        // Generate a mock secure API key for the user
-        apiKey: "aicap_pro_sk_" + Math.random().toString(36).substring(2, 15) + "9x"
+    try {
+      // 1. Attempt to sign in
+      let { data, error } = await supabase.auth.signInWithPassword({
+        email: authForm.email,
+        password: authForm.password,
       });
+
+      // 2. If user doesn't exist, sign them up (MVP Auto-Signup)
+      if (error && error.message.includes("Invalid login credentials")) {
+        const res = await supabase.auth.signUp({
+          email: authForm.email,
+          password: authForm.password,
+        });
+        data = res.data;
+        error = res.error;
+      }
+
+      if (error) throw error;
+
+      if (data.user) {
+        // 3. Fetch or provision the API Key
+        let { data: keys } = await supabase.from('api_keys').select('token').eq('user_id', data.user.id);
+        let apiKey = keys && keys.length > 0 ? keys[0].token : "";
+        
+        if (!apiKey) {
+          apiKey = "aicap_pro_sk_" + Math.random().toString(36).substring(2, 15) + "9x";
+          await supabase.from('api_keys').insert([{ user_id: data.user.id, token: apiKey }]);
+        }
+
+        setSession({ user: data.user, apiKey });
+        fetchHistoryData();
+      }
+    } catch (err) {
+      alert(err.message);
+    } finally {
       setAuthForm({ ...authForm, loading: false });
-      fetchHistoryData(); // Load their specific history
-    }, 800);
+    }
   };
 
   const getRiskBadge = (level) => {
@@ -191,7 +225,10 @@ ${scanData.dependencies.map(d => `- **${d.name}** (v${d.version}): ${d.descripti
             <div className="flex items-center gap-3">
               <span className="px-2 py-1 bg-indigo-100 text-indigo-700 text-xs font-bold rounded">PRO CLOUD</span>
               {session && (
-                <button onClick={() => setSession(null)} className="flex items-center gap-1 text-xs text-slate-500 hover:text-slate-700 transition">
+                <button onClick={async () => {
+                  await supabase.auth.signOut();
+                  setSession(null);
+                }} className="flex items-center gap-1 text-xs text-slate-500 hover:text-slate-700 transition">
                   <LogOut className="w-3 h-3" /> Sign Out
                 </button>
               )}
