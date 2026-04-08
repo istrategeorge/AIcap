@@ -327,6 +327,7 @@ ${scanData.dependencies.map(d => `- **${d.name}** (v${d.version}): ${d.descripti
             </div>
           )}
         </div>
+      )
       ) : (
         /* LOCAL DEVELOPER VIEW */
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
