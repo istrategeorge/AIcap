@@ -11,6 +11,7 @@ const defaultScanData = {
 };
 
 const API_BASE_URL = import.meta.env.VITE_API_URL || "http://localhost:8080";
+const IS_CLOUD_SAAS = API_BASE_URL !== "http://localhost:8080";
 
 export default function App() {
   const [scanData, setScanData] = useState(defaultScanData);
@@ -64,7 +65,9 @@ export default function App() {
 
   // Fetch on initial load
   useEffect(() => {
-    fetchScanData();
+    if (!IS_CLOUD_SAAS) {
+      fetchScanData();
+    }
     fetchDbStatus();
   }, []);
 
@@ -163,20 +166,98 @@ ${scanData.dependencies.map(d => `- **${d.name}** (v${d.version}): ${d.descripti
         <div className="flex items-center gap-3">
           <Shield className="w-8 h-8 text-indigo-600" />
           <h1 className="text-xl font-bold tracking-tight">AI-BOM Compliance Automator</h1>
+          {IS_CLOUD_SAAS && <span className="px-2 py-1 bg-indigo-100 text-indigo-700 text-xs font-bold rounded">PRO CLOUD</span>}
         </div>
-        <div className="flex items-center gap-4 text-sm font-medium">
-          <span className="text-slate-500">Project: <span className="text-slate-900">{scanData.projectName}</span></span>
-          <button 
-            onClick={fetchScanData}
-            disabled={isScanning}
-            className="flex items-center gap-2 bg-indigo-50 text-indigo-700 px-4 py-2 rounded-lg hover:bg-indigo-100 transition disabled:opacity-50"
-          >
-            <RefreshCw className={`w-4 h-4 ${isScanning ? 'animate-spin' : ''}`} /> 
-            {isScanning ? 'Scanning...' : 'Rescan Repository'}
-          </button>
-        </div>
+        {!IS_CLOUD_SAAS && (
+          <div className="flex items-center gap-4 text-sm font-medium">
+            <span className="text-slate-500">Project: <span className="text-slate-900">{scanData.projectName}</span></span>
+            <button 
+              onClick={fetchScanData}
+              disabled={isScanning}
+              className="flex items-center gap-2 bg-indigo-50 text-indigo-700 px-4 py-2 rounded-lg hover:bg-indigo-100 transition disabled:opacity-50"
+            >
+              <RefreshCw className={`w-4 h-4 ${isScanning ? 'animate-spin' : ''}`} /> 
+              {isScanning ? 'Scanning...' : 'Rescan Repository'}
+            </button>
+          </div>
+        )}
       </header>
 
+      {/* CLOUD SAAS VIEW */}
+      {IS_CLOUD_SAAS ? (
+        <div className="space-y-6 max-w-5xl mx-auto">
+          <div className="bg-indigo-600 p-8 rounded-xl shadow-sm text-white">
+            <h2 className="text-2xl font-bold mb-4">Welcome to your AIcap Pro Dashboard</h2>
+            <p className="text-indigo-100 mb-6 max-w-3xl">
+              To maintain EU AI Act compliance without exposing your proprietary source code, the AIcap scanner runs natively inside your own CI/CD infrastructure. Follow the instructions below to connect a repository to this dashboard.
+            </p>
+            <div className="bg-slate-900 p-4 rounded-lg font-mono text-sm text-indigo-300 overflow-x-auto">
+              <p className="text-slate-500 mb-2"># Add this to your .github/workflows/build.yml</p>
+              <p><span className="text-pink-400">-</span> <span className="text-blue-400">name</span>: Run EU AI Act Compliance Scan</p>
+              <p>  <span className="text-blue-400">uses</span>: istrategeorge/AIcap@v1.0.0-alpha</p>
+              <p>  <span className="text-blue-400">with</span>:</p>
+              <p>    <span className="text-blue-400">api-key</span>: {'${{ secrets.AICAP_API_KEY }}'}</p>
+            </div>
+          </div>
+
+          {/* Proof Drill Audit Ledger */}
+          <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
+            <div className="p-6 border-b border-slate-200">
+              <h2 className="text-lg font-bold text-slate-800 flex items-center gap-2">
+                <History className="w-5 h-5 text-slate-400" />
+                Immutable Proof Drills (Audit Ledger)
+              </h2>
+            </div>
+            <div className="overflow-x-auto">
+              <table className="w-full text-left border-collapse">
+                <thead>
+                  <tr className="bg-slate-50 text-slate-500 text-xs uppercase tracking-wider border-b border-slate-200">
+                    <th className="p-4 font-semibold">Timestamp</th>
+                    <th className="p-4 font-semibold">Project</th>
+                    <th className="p-4 font-semibold">Commit SHA</th>
+                    <th className="p-4 font-semibold">Cryptographic Hash (SHA-256)</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100">
+                  {historyData.length === 0 ? (
+                    <tr><td colSpan="4" className="p-4 text-center text-slate-500 text-sm">No proof drills recorded yet. Install the GitHub Action to begin syncing!</td></tr>
+                  ) : (
+                    historyData.map((record, idx) => (
+                      <tr key={idx} className="hover:bg-slate-100 transition cursor-pointer" onClick={() => fetchHistoricalProof(record.cryptoHash)}>
+                        <td className="p-4 text-slate-600 text-sm whitespace-nowrap">{new Date(record.timestamp).toLocaleString()}</td>
+                        <td className="p-4 font-medium text-slate-900">{record.projectName}</td>
+                        <td className="p-4 text-slate-500 font-mono text-xs">{record.commitSha}</td>
+                        <td className="p-4 text-slate-500 font-mono text-xs truncate max-w-xs" title={record.cryptoHash}>
+                          {record.cryptoHash}
+                        </td>
+                      </tr>
+                    ))
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          {/* Annex IV Output Preview (Historical) */}
+          {historicalProof && (
+            <div className="mt-6 bg-slate-900 rounded-xl shadow-sm border border-slate-700 overflow-hidden text-slate-300 animate-in fade-in slide-in-from-bottom-4 duration-500">
+              <div className="px-4 py-2 bg-slate-800 border-b border-slate-700 flex items-center justify-between">
+                <div className="flex items-center gap-3">
+                  <span className="text-xs font-mono text-slate-400">Historical Record ({historicalProof.hash.substring(0, 8)})</span>
+                  <span className="text-xs px-2 py-1 rounded text-blue-400 bg-blue-400/10">Immutable Ledger</span>
+                </div>
+                <button onClick={handleDownloadMarkdown} className="text-xs flex items-center gap-1 text-slate-300 hover:text-white bg-slate-700 hover:bg-slate-600 px-3 py-1 rounded transition">
+                  <Download className="w-3 h-3" /> Download
+                </button>
+              </div>
+              <div className="p-6 font-mono text-sm overflow-x-auto whitespace-pre">
+                {getDisplayedMarkdown()}
+              </div>
+            </div>
+          )}
+        </div>
+      ) : (
+        /* LOCAL DEVELOPER VIEW */
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         
         {/* Left Column: Posture & Actions */}
@@ -442,6 +523,7 @@ ${scanData.dependencies.map(d => `- **${d.name}** (v${d.version}): ${d.descripti
         </div>
 
       </div>
+      )}
     </div>
   );
 }
