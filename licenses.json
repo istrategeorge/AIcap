@@ -1,0 +1,10 @@
+{
+  "llama-3": { "hf_id": "meta-llama/Meta-Llama-3-8B" },
+  "llama-2": { "hf_id": "meta-llama/Llama-2-7b-hf" },
+  "mixtral": { "hf_id": "mistralai/Mixtral-8x7B-v0.1" },
+  "mistral": { "hf_id": "mistralai/Mistral-7B-v0.1" },
+  "gpt-4": { "license": "Proprietary (OpenAI)" },
+  "o1-": { "license": "Proprietary (OpenAI)" },
+  "claude-3": { "license": "Proprietary (Anthropic)" },
+  "gemini": { "license": "Proprietary (Google)" }
+}

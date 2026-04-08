@@ -1,0 +1,13 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: heavy-llm-workload
+spec:
+  template:
+    spec:
+      containers:
+      - name: llm-container
+        image: vllm/vllm-openai:latest
+        resources:
+          limits:
+            nvidia.com/gpu: 4

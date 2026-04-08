@@ -1,0 +1,40 @@
+name: "Continuous AI-BOM Scanner"
+description: "Automated EU AI Act compliance scanner. Detects AI models, dependencies, and FinOps risks."
+author: "AIcap"
+
+branding:
+  icon: 'shield'
+  color: 'indigo'
+
+inputs:
+  scan-directory:
+    description: "The directory to scan for AI dependencies"
+    required: false
+    default: "."
+  supabase-url:
+    description: "Optional: Supabase DB URL to persist the Immutable Proof Drill"
+    required: false
+
+runs:
+  using: "composite"
+  steps:
+    - name: Download AIcap Scanner
+      shell: bash
+      run: |
+        echo "⬇️ Downloading latest AIcap statically-linked binary..."
+        # In production, you will uncomment this to download your compiled release:
+        # curl -sL https://github.com/your-username/AIcap/releases/latest/download/aicap-linux-amd64 -o aicap
+        
+        # For MVP local testing, we compile it on the fly if the source is present:
+        if [ -f "main.go" ]; then
+          go build -o aicap main.go
+        fi
+        chmod +x aicap
+
+    - name: Execute AI-BOM Scan
+      shell: bash
+      env:
+        SUPABASE_DB_URL: ${{ inputs.supabase-url }}
+      run: |
+        echo "🔍 Starting Continuous AI-BOM Scan on directory: ${{ inputs.scan-directory }}"
+        ./aicap --cli
