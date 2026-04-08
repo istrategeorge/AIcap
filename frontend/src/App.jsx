@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from "react";
-import { Shield, AlertTriangle, FileText, CheckCircle, Database, Server, RefreshCw, History, Download, DollarSign } from 'lucide-react';
+import { Shield, AlertTriangle, FileText, CheckCircle, Database, Server, RefreshCw, History, Download, DollarSign, Key, LogOut } from 'lucide-react';
 
 // Default state before fetch
 const defaultScanData = {
@@ -23,6 +23,10 @@ export default function App() {
   const [dbConfig, setDbConfig] = useState({ enabled: false, url: "", connected: false });
   const [dbConnecting, setDbConnecting] = useState(false);
   const [dbError, setDbError] = useState("");
+  
+  // Auth State
+  const [session, setSession] = useState(null);
+  const [authForm, setAuthForm] = useState({ email: "", password: "", loading: false });
 
   // Fetch DB status on load
   const fetchDbStatus = async () => {
@@ -115,6 +119,23 @@ export default function App() {
     }
   };
 
+  // Handle User Login/Signup
+  const handleAuth = (e) => {
+    e.preventDefault();
+    setAuthForm({ ...authForm, loading: true });
+    
+    // MVP Simulation: In production, this is replaced by supabase.auth.signInWithPassword()
+    setTimeout(() => {
+      setSession({
+        user: { email: authForm.email },
+        // Generate a mock secure API key for the user
+        apiKey: "aicap_pro_sk_" + Math.random().toString(36).substring(2, 15) + "9x"
+      });
+      setAuthForm({ ...authForm, loading: false });
+      fetchHistoryData(); // Load their specific history
+    }, 800);
+  };
+
   const getRiskBadge = (level) => {
     switch(level) {
       case 'High': return <span className="px-2 py-1 bg-red-100 text-red-700 text-xs font-bold rounded-full">HIGH RISK (EU AI Act)</span>;
@@ -166,7 +187,16 @@ ${scanData.dependencies.map(d => `- **${d.name}** (v${d.version}): ${d.descripti
         <div className="flex items-center gap-3">
           <Shield className="w-8 h-8 text-indigo-600" />
           <h1 className="text-xl font-bold tracking-tight">AI-BOM Compliance Automator</h1>
-          {IS_CLOUD_SAAS && <span className="px-2 py-1 bg-indigo-100 text-indigo-700 text-xs font-bold rounded">PRO CLOUD</span>}
+          {IS_CLOUD_SAAS && (
+            <div className="flex items-center gap-3">
+              <span className="px-2 py-1 bg-indigo-100 text-indigo-700 text-xs font-bold rounded">PRO CLOUD</span>
+              {session && (
+                <button onClick={() => setSession(null)} className="flex items-center gap-1 text-xs text-slate-500 hover:text-slate-700 transition">
+                  <LogOut className="w-3 h-3" /> Sign Out
+                </button>
+              )}
+            </div>
+          )}
         </div>
         {!IS_CLOUD_SAAS && (
           <div className="flex items-center gap-4 text-sm font-medium">
@@ -185,20 +215,61 @@ ${scanData.dependencies.map(d => `- **${d.name}** (v${d.version}): ${d.descripti
 
       {/* CLOUD SAAS VIEW */}
       {IS_CLOUD_SAAS ? (
-        <div className="space-y-6 max-w-5xl mx-auto">
-          <div className="bg-indigo-600 p-8 rounded-xl shadow-sm text-white">
-            <h2 className="text-2xl font-bold mb-4">Welcome to your AIcap Pro Dashboard</h2>
-            <p className="text-indigo-100 mb-6 max-w-3xl">
-              To maintain EU AI Act compliance without exposing your proprietary source code, the AIcap scanner runs natively inside your own CI/CD infrastructure. Follow the instructions below to connect a repository to this dashboard.
-            </p>
-            <div className="bg-slate-900 p-4 rounded-lg font-mono text-sm text-indigo-300 overflow-x-auto">
-              <p className="text-slate-500 mb-2"># Add this to your .github/workflows/build.yml</p>
-              <p><span className="text-pink-400">-</span> <span className="text-blue-400">name</span>: Run EU AI Act Compliance Scan</p>
-              <p>  <span className="text-blue-400">uses</span>: istrategeorge/AIcap@v1.0.0-alpha</p>
-              <p>  <span className="text-blue-400">with</span>:</p>
-              <p>    <span className="text-blue-400">api-key</span>: {'${{ secrets.AICAP_API_KEY }}'}</p>
+        !session ? (
+          /* Authentication Screen */
+          <div className="max-w-md mx-auto mt-16 bg-white p-8 rounded-2xl shadow-sm border border-slate-200 animate-in fade-in zoom-in-95 duration-300">
+            <div className="text-center mb-8">
+              <div className="w-16 h-16 bg-indigo-100 rounded-full flex items-center justify-center mx-auto mb-4">
+                <Shield className="w-8 h-8 text-indigo-600" />
+              </div>
+              <h2 className="text-2xl font-bold text-slate-900">Sign in to AIcap Pro</h2>
+              <p className="text-slate-500 text-sm mt-2">Access your immutable audit ledger and manage your pipeline API keys.</p>
             </div>
+            <form onSubmit={handleAuth} className="space-y-5">
+              <div>
+                <label className="block text-sm font-medium text-slate-700 mb-1.5">Work Email</label>
+                <input type="email" required value={authForm.email} onChange={e => setAuthForm({...authForm, email: e.target.value})} className="w-full p-2.5 border border-slate-300 rounded-lg focus:ring-2 focus:ring-indigo-500 outline-none transition" placeholder="you@company.com" />
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-slate-700 mb-1.5">Password</label>
+                <input type="password" required value={authForm.password} onChange={e => setAuthForm({...authForm, password: e.target.value})} className="w-full p-2.5 border border-slate-300 rounded-lg focus:ring-2 focus:ring-indigo-500 outline-none transition" placeholder="••••••••" />
+              </div>
+              <button type="submit" disabled={authForm.loading} className="w-full bg-indigo-600 text-white font-bold py-3 rounded-lg hover:bg-indigo-700 transition disabled:opacity-50 mt-2">
+                {authForm.loading ? 'Authenticating...' : 'Sign In / Create Account'}
+              </button>
+            </form>
           </div>
+        ) : (
+          /* Authenticated Dashboard */
+          <div className="space-y-6 max-w-5xl mx-auto animate-in fade-in duration-500">
+            <div className="bg-indigo-600 p-8 rounded-xl shadow-sm text-white flex flex-col md:flex-row justify-between items-start md:items-center gap-6">
+              <div className="max-w-2xl">
+                <h2 className="text-2xl font-bold mb-2">Welcome back, {session.user.email.split('@')[0]}</h2>
+                <p className="text-indigo-100 text-sm">
+                  To maintain EU AI Act compliance without exposing your proprietary source code, the AIcap scanner runs natively inside your own CI/CD infrastructure. Connect your repository using your secret API key.
+                </p>
+                
+                <div className="mt-6 bg-slate-900/80 p-4 rounded-lg font-mono text-sm text-indigo-300 overflow-x-auto border border-indigo-500/30">
+                  <p className="text-slate-500 mb-2"># Add this to your .github/workflows/build.yml</p>
+                  <p><span className="text-pink-400">-</span> <span className="text-blue-400">name</span>: Run EU AI Act Compliance Scan</p>
+                  <p>  <span className="text-blue-400">uses</span>: istrategeorge/AIcap@v1.0.0-alpha</p>
+                  <p>  <span className="text-blue-400">with</span>:</p>
+                  <p>    <span className="text-blue-400">api-key</span>: {'${{ secrets.AICAP_API_KEY }}'}</p>
+                </div>
+              </div>
+              
+              {/* API Key Display Panel */}
+              <div className="bg-indigo-800/50 p-5 rounded-xl border border-indigo-400/30 w-full md:w-auto shrink-0">
+                <div className="flex items-center gap-2 mb-3 text-indigo-100">
+                  <Key className="w-4 h-4" />
+                  <h3 className="text-sm font-bold uppercase tracking-wider">Your Secret API Key</h3>
+                </div>
+                <code className="block bg-slate-900 text-emerald-400 px-4 py-2.5 rounded-lg text-sm select-all font-mono border border-slate-700">
+                  {session.apiKey}
+                </code>
+                <p className="text-indigo-200 text-xs mt-3 max-w-[240px]">Save this key in your GitHub repository secrets. Do not share it publicly.</p>
+              </div>
+            </div>
 
           {/* Proof Drill Audit Ledger */}
           <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
