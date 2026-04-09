@@ -22,6 +22,9 @@ import (
 	"time"
 
 	_ "github.com/lib/pq"
+	"github.com/stripe/stripe-go/v79"
+	"github.com/stripe/stripe-go/v79/checkout/session"
+	"github.com/stripe/stripe-go/v79/webhook"
 )
 
 // AIDependency represents an identified AI library/model in the codebase
