@@ -138,6 +138,9 @@ func main() {
 
 		// Phase 7: Sync to SaaS if Pro API Key is present
 		apiKey := os.Getenv("AICAP_API_KEY")
+
+		fmt.Printf("\n[DEBUG] Length of AICAP_API_KEY environment variable: %d\n", len(apiKey))
+
 		if apiKey != "" {
 			fmt.Println("\n[+] Pro API Key detected. Syncing AI-BOM and Proof Drill to AIcap Cloud...")
 			req, err := http.NewRequest("POST", "https://aicap.onrender.com/api/save-proof", bytes.NewBuffer(bomJSON))
