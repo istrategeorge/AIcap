@@ -74,12 +74,50 @@ export default function App() {
     }
   };
 
+  // Fetch and set user session + API Key
+  const fetchAndSetUserSession = async (user) => {
+    try {
+      let { data: keys } = await supabase.from('api_keys').select('token').eq('user_id', user.id);
+      let apiKey = keys && keys.length > 0 ? keys[0].token : "";
+      
+      if (!apiKey) {
+        apiKey = "aicap_pro_sk_" + Math.random().toString(36).substring(2, 15) + "9x";
+        await supabase.from('api_keys').insert([{ user_id: user.id, token: apiKey }]);
+      }
+
+      setSession({ user, apiKey });
+      fetchHistoryData();
+    } catch (error) {
+      console.error("Failed to load user API key:", error);
+    }
+  };
+
   // Fetch on initial load
   useEffect(() => {
     if (!IS_CLOUD_SAAS) {
       fetchScanData();
     }
     fetchDbStatus();
+
+    if (IS_CLOUD_SAAS) {
+      // Check active session and fetch API key on page load
+      supabase.auth.getSession().then(({ data: { session } }) => {
+        if (session && session.user) {
+          fetchAndSetUserSession(session.user);
+        }
+      });
+
+      // Listen for auth changes (e.g., logging in, or logging out from another tab)
+      const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+        if (session && session.user) {
+          fetchAndSetUserSession(session.user);
+        } else {
+          setSession(null);
+        }
+      });
+
+      return () => subscription.unsubscribe();
+    }
   }, []);
 
   const fetchHistoricalProof = async (hash) => {
@@ -140,19 +178,6 @@ export default function App() {
 
       if (error) throw error;
 
-      if (data.user) {
-        // 3. Fetch or provision the API Key
-        let { data: keys } = await supabase.from('api_keys').select('token').eq('user_id', data.user.id);
-        let apiKey = keys && keys.length > 0 ? keys[0].token : "";
-        
-        if (!apiKey) {
-          apiKey = "aicap_pro_sk_" + Math.random().toString(36).substring(2, 15) + "9x";
-          await supabase.from('api_keys').insert([{ user_id: data.user.id, token: apiKey }]);
-        }
-
-        setSession({ user: data.user, apiKey });
-        fetchHistoryData();
-      }
     } catch (err) {
       alert(err.message);
     } finally {
