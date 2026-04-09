@@ -12,6 +12,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -82,6 +83,9 @@ var modelLicenseMap map[string]LicenseMapping
 var db *sql.DB
 
 // isCloudSaaS determines if the server is running in managed cloud mode
+// In production, the Stripe webhook handler will always run in cloudSaaS mode
+// The local `db-config` endpoint allows local developers to simulate a DB.
+// We rely on SUPABASE_DB_URL presence to indicate cloud vs local
 var isCloudSaaS bool
 
 //go:embed libraries.json models.json licenses.json
@@ -194,7 +198,13 @@ func main() {
 		}
 		fmt.Println("Connected to Supabase PostgreSQL successfully!")
 	} else {
+		// In a real cloud environment, a missing DB URL for the backend is an error.
+		// For local dev, we allow it for the local UI, but cloud functionality needs it.
+		if os.Getenv("RENDER") == "true" || os.Getenv("VERCEL") == "true" { // Render/Vercel specific env vars
+			log.Fatal("Error: SUPABASE_DB_URL is not set in cloud environment. Database connection required for SaaS features.")
+		}
 		fmt.Println("Warning: SUPABASE_DB_URL not set. Running in memory only.")
+		db = nil // Ensure db is nil if no URL is set
 	}
 
 	http.HandleFunc("/api/scan", func(w http.ResponseWriter, r *http.Request) {
@@ -372,6 +382,129 @@ func main() {
 		}
 
 		json.NewEncoder(w).Encode(map[string]string{"markdown": markdown})
+	})
+
+	// Endpoint to create a Stripe Checkout Session
+	http.HandleFunc("/api/create-checkout-session", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+
+		if r.Method == "OPTIONS" {
+			return
+		}
+
+		if r.Method != "POST" {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		if !isCloudSaaS || db == nil {
+			http.Error(w, "SaaS features require cloud deployment and database connection", http.StatusInternalServerError)
+			return
+		}
+
+		// We expect the email from the authenticated user to create the checkout session
+		var requestBody struct {
+			UserEmail string `json:"userEmail"`
+			UserID    string `json:"userID"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&requestBody); err != nil {
+			http.Error(w, "Invalid request body", http.StatusBadRequest)
+			return
+		}
+
+		stripe.Key = os.Getenv("STRIPE_SECRET_KEY")
+		if stripe.Key == "" {
+			log.Println("STRIPE_SECRET_KEY is not set.")
+			http.Error(w, "Stripe secret key not configured", http.StatusInternalServerError)
+			return
+		}
+
+		// Define a product or price ID in Stripe Dashboard (e.g., 'price_12345')
+		// For MVP, we use a fixed price. In production, this would be dynamic.
+		priceID := "price_1Pdtg1E5iL2Zl43n5G4YhI9t" // Replace with your actual Stripe Price ID
+		if os.Getenv("STRIPE_PRICE_ID") != "" {
+			priceID = os.Getenv("STRIPE_PRICE_ID")
+		}
+
+		params := &stripe.CheckoutSessionParams{
+			LineItems: []*stripe.CheckoutSessionLineItemParams{
+				{
+					Price:    stripe.String(priceID),
+					Quantity: stripe.Int64(1),
+				},
+			},
+			Mode:          stripe.String(string(stripe.CheckoutSessionModeSubscription)),
+			SuccessURL:    stripe.String(os.Getenv("VITE_FRONTEND_URL") + "/success?session_id={CHECKOUT_SESSION_ID}"),
+			CancelURL:     stripe.String(os.Getenv("VITE_FRONTEND_URL") + "/cancel"),
+			CustomerEmail: stripe.String(requestBody.UserEmail),
+			Metadata: map[string]string{
+				"user_id": requestBody.UserID,
+			},
+		}
+
+		session, err := session.New(params)
+		if err != nil {
+			log.Printf("Error creating checkout session: %v", err)
+			http.Error(w, "Failed to create checkout session", http.StatusInternalServerError)
+			return
+		}
+
+		json.NewEncoder(w).Encode(map[string]string{"sessionId": session.ID, "url": session.URL})
+	})
+
+	// Stripe Webhook Handler
+	http.HandleFunc("/api/stripe-webhook", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		if !isCloudSaaS || db == nil {
+			http.Error(w, "Webhook features require cloud deployment and database connection", http.StatusInternalServerError)
+			return
+		}
+
+		const MaxBodyBytes = int64(65536)
+		r.Body = http.MaxBytesReader(w, r.Body, MaxBodyBytes)
+		payload, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Error reading request body: %v", err), http.StatusServiceUnavailable)
+			return
+		}
+
+		endpointSecret := os.Getenv("STRIPE_WEBHOOK_SECRET")
+		event, err := webhook.ConstructEvent(payload, r.Header.Get("stripe-signature"), endpointSecret)
+		if err != nil {
+			log.Printf("Error verifying webhook signature: %v", err)
+			http.Error(w, "Webhook signature verification failed", http.StatusBadRequest)
+			return
+		}
+
+		switch event.Type {
+		case "checkout.session.completed":
+			var checkoutSession stripe.CheckoutSession
+			err := json.Unmarshal(event.Data.Raw, &checkoutSession)
+			if err != nil {
+				log.Printf("Error parsing webhook JSON: %v", err)
+				http.Error(w, "Error parsing webhook JSON", http.StatusBadRequest)
+				return
+			}
+
+			log.Printf("Checkout session completed for customer: %s, UserID: %s", checkoutSession.CustomerEmail, checkoutSession.Metadata["user_id"])
+
+			// ** IMPORTANT: In a real app, here you would:
+			// 1. Verify payment status and that the user is actually subscribed.
+			// 2. Provision the API Key for checkoutSession.Metadata["user_id"] in your 'api_keys' table.
+			//    For now, API keys are provisioned on first login for simplicity. This can be enhanced later.
+
+		// Add handlers for other event types (e.g., 'invoice.payment_succeeded', 'customer.subscription.deleted')
+		default:
+			log.Printf("Unhandled event type: %s", event.Type)
+		}
+
+		w.WriteHeader(http.StatusOK)
 	})
 
 	log.Fatal(http.ListenAndServe(":"+port, nil))
