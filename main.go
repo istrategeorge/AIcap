@@ -45,6 +45,7 @@ type FinOpsFinding struct {
 // AIBOM represents the final Software Bill of Materials for AI
 type AIBOM struct {
 	ProjectName  string          `json:"projectName"`
+	CommitSha    string          `json:"commitSha,omitempty"`
 	ScannedFiles int             `json:"scannedFiles"`
 	Dependencies []AIDependency  `json:"dependencies"`
 	FinOps       []FinOpsFinding `json:"finOps"`
@@ -132,6 +133,14 @@ func main() {
 	if len(os.Args) > 1 && os.Args[1] == "--cli" {
 		fmt.Println("Running AIcap in CI/CD CLI mode...")
 		bom := performScan(".")
+
+		// Pull exact repository and commit data from GitHub Actions environment
+		if repo := os.Getenv("GITHUB_REPOSITORY"); repo != "" {
+			bom.ProjectName = repo
+		}
+		if sha := os.Getenv("GITHUB_SHA"); sha != "" {
+			bom.CommitSha = sha
+		}
 
 		bomJSON, _ := json.MarshalIndent(bom, "", "  ")
 		fmt.Println(string(bomJSON))
@@ -280,7 +289,10 @@ func main() {
 		}
 
 		// 2. Create the immutable Proof Drill ledger entry
-		commitSha := "local-dev-uncommitted" // In a real CI environment, this comes from git variables
+		commitSha := bom.CommitSha
+		if commitSha == "" {
+			commitSha = "local-dev-uncommitted"
+		}
 		annexIVMarkdown := generateAnnexIVMarkdown(bom)
 
 		// Generate a real SHA-256 cryptographic hash
