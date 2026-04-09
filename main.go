@@ -380,22 +380,53 @@ func main() {
 // generateAnnexIVMarkdown creates a dynamic markdown template based on the AI-BOM
 func generateAnnexIVMarkdown(bom AIBOM) string {
 	var sb strings.Builder
-	sb.WriteString("# EU AI Act Annex IV: Technical Documentation\n\n")
+	sb.WriteString("# EU AI Act - Annex IV Technical Documentation\n\n")
 
-	sb.WriteString("## 1. System Description\n")
-	sb.WriteString(fmt.Sprintf("**System Name:** %s\n", bom.ProjectName))
-	sb.WriteString("**Intended Purpose:** [To be completed by engineer]\n\n")
+	sb.WriteString("## 1. General System Description (Annex IV, Section 1)\n")
+	sb.WriteString(fmt.Sprintf("- **System Name:** %s\n", bom.ProjectName))
+	sb.WriteString(fmt.Sprintf("- **Version / Commit SHA:** `%s`\n", bom.CommitSha))
+	sb.WriteString("- **Intended Purpose:** `[REQUIRES MANUAL INPUT: Describe the exact purpose of this AI system]`\n\n")
 
-	sb.WriteString("## 2. Architecture and Dependencies\n")
-	sb.WriteString("The system utilizes the following pre-trained models and libraries identified via automated scan:\n\n")
-	for _, dep := range bom.Dependencies {
-		sb.WriteString(fmt.Sprintf("- **%s** (v%s): %s\n", dep.Name, dep.Version, dep.Description))
+	sb.WriteString("## 2. System Architecture & Components (Annex IV, Section 2)\n")
+	sb.WriteString("### 2(a) Pre-trained Systems & Dependencies (AI-BOM)\n")
+	if len(bom.Dependencies) == 0 {
+		sb.WriteString("No AI dependencies detected.\n\n")
+	} else {
+		for _, dep := range bom.Dependencies {
+			licenseText := ""
+			if dep.License != "" {
+				licenseText = fmt.Sprintf(" [License: %s]", dep.License)
+			}
+			sb.WriteString(fmt.Sprintf("- **%s** (v%s)%s: %s (Risk: %s)\n", dep.Name, dep.Version, licenseText, dep.Description, dep.RiskLevel))
+		}
+		sb.WriteString("\n")
 	}
 
-	sb.WriteString("\n## 3. Article 9: Risk Management Framework\n")
-	sb.WriteString("*Automated controls generated via CI/CD pipeline:*\n")
-	sb.WriteString("- [x] Dependency version locking enforced.\n")
-	sb.WriteString("- [ ] Prompt injection sanitization verified (Pending Test Coverage).\n")
+	sb.WriteString("### 2(c) Hardware Requirements & Deployment (FinOps Telemetry)\n")
+	if len(bom.FinOps) == 0 {
+		sb.WriteString("No specific hardware constraints or GPU requests detected in infrastructure manifests.\n\n")
+	} else {
+		for _, fin := range bom.FinOps {
+			sb.WriteString(fmt.Sprintf("- **Resource:** %s\n", fin.Resource))
+			sb.WriteString(fmt.Sprintf("  - **Finding:** %s\n", fin.Description))
+		}
+		sb.WriteString("\n")
+	}
+
+	sb.WriteString("## 3. Continuous Risk Management (Article 9 & Annex IV, Section 4)\n")
+	sb.WriteString(fmt.Sprintf("**Current Automated Posture:** %s\n\n", bom.Compliance))
+	sb.WriteString("*Automated CI/CD Pipeline Controls:*\n")
+	if bom.Compliance == "Passed" {
+		sb.WriteString("- [x] High-risk dependency constraints validated.\n")
+	} else {
+		sb.WriteString("- [ ] **BLOCKER:** High-risk AI dependencies detected without explicit mitigation.\n")
+	}
+	sb.WriteString("- [ ] `[REQUIRES MANUAL INPUT: Detail prompt injection mitigation strategy]`\n\n")
+
+	sb.WriteString("## 4. Human Oversight & Data Governance (Annex IV, Section 3)\n")
+	sb.WriteString("- **Human-in-the-loop (HITL) Controls:** `[REQUIRES MANUAL INPUT]`\n")
+	sb.WriteString("- **Training Data Provenance:** `[REQUIRES MANUAL INPUT]`\n")
+
 	return sb.String()
 }
 

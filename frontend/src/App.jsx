@@ -170,22 +170,30 @@ export default function App() {
 
   const getDisplayedMarkdown = () => {
     if (historicalProof) return historicalProof.markdown;
-    return `# EU AI Act Annex IV: Technical Documentation
+    return `# EU AI Act - Annex IV Technical Documentation
 
-## 1. System Description
-**System Name:** ${scanData.projectName}
-**Intended Purpose:** [To be completed by engineer]
+## 1. General System Description (Annex IV, Section 1)
+- **System Name:** ${scanData.projectName}
+- **Version / Commit SHA:** \`Pending CI/CD Injection\`
+- **Intended Purpose:** \`[REQUIRES MANUAL INPUT: Describe the exact purpose of this AI system]\`
 
-## 2. Architecture and Dependencies
-The system utilizes the following pre-trained models and libraries identified via automated scan:
+## 2. System Architecture & Components (Annex IV, Section 2)
+### 2(a) Pre-trained Systems & Dependencies (AI-BOM)
+${scanData.dependencies.length > 0 ? scanData.dependencies.map(d => `- **${d.name}** (v${d.version})${d.license ? ` [License: ${d.license}]` : ''}: ${d.description} (Risk: ${d.riskLevel})`).join('\n') : 'No AI dependencies detected.'}
 
-${scanData.dependencies.map(d => `- **${d.name}** (v${d.version}): ${d.description}${d.license ? ` [License: ${d.license}]` : ''}`).join('\n')}
+### 2(c) Hardware Requirements & Deployment (FinOps Telemetry)
+${scanData.finOps && scanData.finOps.length > 0 ? scanData.finOps.map(f => `- **Resource:** ${f.resource}\n  - **Finding:** ${f.description}`).join('\n') : 'No specific hardware constraints or GPU requests detected in infrastructure manifests.'}
 
-## 3. Article 9: Risk Management Framework
-*Automated controls generated via CI/CD pipeline:*
-- [x] Dependency version locking enforced.
-- [ ] Prompt injection sanitization verified (Pending Test Coverage).
-...
+## 3. Continuous Risk Management (Article 9 & Annex IV, Section 4)
+**Current Automated Posture:** ${scanData.complianceStatus}
+
+*Automated CI/CD Pipeline Controls:*
+${scanData.complianceStatus === 'Passed' ? '- [x] High-risk dependency constraints validated.' : '- [ ] **BLOCKER:** High-risk AI dependencies detected without explicit mitigation.'}
+- [ ] \`[REQUIRES MANUAL INPUT: Detail prompt injection mitigation strategy]\`
+
+## 4. Human Oversight & Data Governance (Annex IV, Section 3)
+- **Human-in-the-loop (HITL) Controls:** \`[REQUIRES MANUAL INPUT]\`
+- **Training Data Provenance:** \`[REQUIRES MANUAL INPUT]\`
 `;
   };
 
