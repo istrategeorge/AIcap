@@ -20,3 +20,5 @@ jobs:
 
       - name: Run AIcap Compliance Scan
         uses: ./
+        with:
+          api-key: ${{ secrets.AICAP_API_KEY }}
