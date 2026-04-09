@@ -138,16 +138,6 @@ export default function App() {
         password: authForm.password,
       });
 
-      // 2. If user doesn't exist, sign them up (MVP Auto-Signup)
-      if (error && error.message.includes("Invalid login credentials")) {
-        const res = await supabase.auth.signUp({
-          email: authForm.email,
-          password: authForm.password,
-        });
-        data = res.data;
-        error = res.error;
-      }
-
       if (error) throw error;
 
       if (data.user) {
@@ -272,7 +262,7 @@ ${scanData.dependencies.map(d => `- **${d.name}** (v${d.version}): ${d.descripti
                 <input type="password" required value={authForm.password} onChange={e => setAuthForm({...authForm, password: e.target.value})} className="w-full p-2.5 border border-slate-300 rounded-lg focus:ring-2 focus:ring-indigo-500 outline-none transition" placeholder="••••••••" />
               </div>
               <button type="submit" disabled={authForm.loading} className="w-full bg-indigo-600 text-white font-bold py-3 rounded-lg hover:bg-indigo-700 transition disabled:opacity-50 mt-2">
-                {authForm.loading ? 'Authenticating...' : 'Sign In / Create Account'}
+                {authForm.loading ? 'Authenticating...' : 'Sign In'}
               </button>
             </form>
           </div>
