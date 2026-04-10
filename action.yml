@@ -4,7 +4,7 @@ author: "AIcap"
 
 branding:
   icon: 'shield'
-  color: 'indigo'
+  color: 'blue'
 
 inputs:
   scan-directory:
