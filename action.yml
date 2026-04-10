@@ -21,8 +21,8 @@ runs:
     - name: Download AIcap Scanner
       shell: bash
       run: |
-        echo "⬇️ Downloading AIcap v1.0.0-alpha statically-linked binary..."
-        curl -sL https://github.com/istrategeorge/AIcap/releases/download/1.0.0-alpha/aicap-linux-amd64 -o aicap
+        echo "⬇️ Downloading AIcap v1.0.0-beta statically-linked binary..."
+        curl -sL https://github.com/istrategeorge/AIcap/releases/download/1.0.0-beta/aicap-linux-amd64 -o aicap
         chmod +x aicap
 
     - name: Execute AI-BOM Scan
@@ -31,4 +31,4 @@ runs:
         AICAP_API_KEY: ${{ inputs.api-key }}
       run: |
         echo "🔍 Starting Continuous AI-BOM Scan on directory: ${{ inputs.scan-directory }}"
-        ./aicap --cli
+        ./aicap --cli "${{ inputs.scan-directory }}"

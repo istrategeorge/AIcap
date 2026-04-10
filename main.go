@@ -138,8 +138,12 @@ func init() {
 func main() {
 	// Headless CLI Mode for CI/CD Pipelines
 	if len(os.Args) > 1 && os.Args[1] == "--cli" {
-		fmt.Println("Running AIcap in CI/CD CLI mode...")
-		bom := performScan(".")
+		scanDir := "."
+		if len(os.Args) > 2 {
+			scanDir = os.Args[2]
+		}
+		fmt.Printf("Running AIcap in CI/CD CLI mode on directory: %s\n", scanDir)
+		bom := performScan(scanDir)
 
 		// Pull exact repository and commit data from GitHub Actions environment
 		if repo := os.Getenv("GITHUB_REPOSITORY"); repo != "" {
