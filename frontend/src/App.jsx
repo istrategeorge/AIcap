@@ -34,6 +34,8 @@ export default function App() {
   // Auth State
   const [session, setSession] = useState(null);
   const [authForm, setAuthForm] = useState({ email: "", password: "", loading: false });
+  const [isSignUp, setIsSignUp] = useState(false);
+  const [isCheckoutLoading, setIsCheckoutLoading] = useState(false);
 
   // Fetch DB status on load
   const fetchDbStatus = async () => {
@@ -80,13 +82,18 @@ export default function App() {
       let { data: keys } = await supabase.from('api_keys').select('token').eq('user_id', user.id);
       let apiKey = keys && keys.length > 0 ? keys[0].token : "";
       
-      if (!apiKey) {
+      const urlParams = new URLSearchParams(window.location.search);
+      const sessionId = urlParams.get('session_id');
+
+      // Auto-provision key if they just returned from a successful Stripe checkout
+      if (!apiKey && sessionId) {
         apiKey = "aicap_pro_sk_" + Math.random().toString(36).substring(2, 15) + "9x";
         await supabase.from('api_keys').insert([{ user_id: user.id, token: apiKey }]);
+        window.history.replaceState({}, document.title, "/"); // Clean up the URL
       }
 
       setSession({ user, apiKey });
-      fetchHistoryData();
+      if (apiKey) fetchHistoryData();
     } catch (error) {
       console.error("Failed to load user API key:", error);
     }
@@ -170,11 +177,19 @@ export default function App() {
     setAuthForm({ ...authForm, loading: true });
     
     try {
-      // 1. Attempt to sign in
-      let { data, error } = await supabase.auth.signInWithPassword({
-        email: authForm.email,
-        password: authForm.password,
-      });
+      if (isSignUp) {
+        const { error } = await supabase.auth.signUp({
+          email: authForm.email,
+          password: authForm.password,
+        });
+        if (error) throw error;
+      } else {
+        const { error } = await supabase.auth.signInWithPassword({
+          email: authForm.email,
+          password: authForm.password,
+        });
+        if (error) throw error;
+      }
 
       if (error) throw error;
 
@@ -182,6 +197,27 @@ export default function App() {
       alert(err.message);
     } finally {
       setAuthForm({ ...authForm, loading: false });
+    }
+  };
+
+  const handleCheckout = async () => {
+    setIsCheckoutLoading(true);
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/create-checkout-session`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ userEmail: session.user.email, userID: session.user.id })
+      });
+
+      if (!response.ok) throw new Error("Failed to initialize checkout");
+
+      const data = await response.json();
+      if (data.url) {
+        window.location.href = data.url; // Redirect to Stripe
+      }
+    } catch (error) {
+      alert(error.message);
+      setIsCheckoutLoading(false);
     }
   };
 
@@ -295,12 +331,43 @@ ${scanData.complianceStatus === 'Passed' ? '- [x] High-risk dependency constrain
                 <input type="password" required value={authForm.password} onChange={e => setAuthForm({...authForm, password: e.target.value})} className="w-full p-2.5 border border-slate-300 rounded-lg focus:ring-2 focus:ring-indigo-500 outline-none transition" placeholder="••••••••" />
               </div>
               <button type="submit" disabled={authForm.loading} className="w-full bg-indigo-600 text-white font-bold py-3 rounded-lg hover:bg-indigo-700 transition disabled:opacity-50 mt-2">
-                {authForm.loading ? 'Authenticating...' : 'Sign In'}
+                {authForm.loading ? 'Authenticating...' : (isSignUp ? 'Create Account' : 'Sign In')}
               </button>
             </form>
+            <div className="mt-4 text-center">
+              <button onClick={() => setIsSignUp(!isSignUp)} className="text-sm text-indigo-600 hover:text-indigo-800 font-medium">
+                {isSignUp ? 'Already have an account? Sign In' : 'Need an account? Sign Up'}
+              </button>
+            </div>
           </div>
         ) : (
-          /* Authenticated Dashboard */
+          !session.apiKey ? (
+            /* Paywall / Upgrade Screen */
+            <div className="max-w-lg mx-auto mt-16 bg-white p-8 rounded-2xl shadow-sm border border-slate-200 text-center animate-in fade-in zoom-in-95 duration-300">
+              <div className="w-16 h-16 bg-amber-100 rounded-full flex items-center justify-center mx-auto mb-4">
+                <DollarSign className="w-8 h-8 text-amber-600" />
+              </div>
+              <h2 className="text-2xl font-bold text-slate-900 mb-2">Upgrade to AIcap Pro</h2>
+              <p className="text-slate-500 text-sm mb-6">
+                Unlock the Immutable Audit Ledger, GitOps pipeline integration, and automated EU AI Act Annex IV documentation sync.
+              </p>
+              <div className="bg-slate-50 border border-slate-100 rounded-xl p-6 mb-6 text-left">
+                <ul className="space-y-3">
+                  <li className="flex items-center gap-2 text-sm text-slate-700"><CheckCircle className="w-4 h-4 text-emerald-500"/> Unlimited CI/CD scans</li>
+                  <li className="flex items-center gap-2 text-sm text-slate-700"><CheckCircle className="w-4 h-4 text-emerald-500"/> Cryptographic Proof Drills</li>
+                  <li className="flex items-center gap-2 text-sm text-slate-700"><CheckCircle className="w-4 h-4 text-emerald-500"/> FinOps & GPU Cost Warnings</li>
+                </ul>
+              </div>
+              <button
+                onClick={handleCheckout}
+                disabled={isCheckoutLoading}
+                className="w-full bg-indigo-600 text-white font-bold py-3 rounded-lg hover:bg-indigo-700 transition disabled:opacity-50"
+              >
+                {isCheckoutLoading ? 'Redirecting to Stripe...' : 'Subscribe now for $49/mo'}
+              </button>
+            </div>
+          ) : (
+          /* Authenticated Pro Dashboard */
           <div className="space-y-6 max-w-5xl mx-auto animate-in fade-in duration-500">
             <div className="bg-indigo-600 p-8 rounded-xl shadow-sm text-white flex flex-col md:flex-row justify-between items-start md:items-center gap-6">
               <div className="max-w-2xl">
@@ -387,6 +454,7 @@ ${scanData.complianceStatus === 'Passed' ? '- [x] High-risk dependency constrain
             </div>
           )}
         </div>
+        )
       )
       ) : (
         /* LOCAL DEVELOPER VIEW */
