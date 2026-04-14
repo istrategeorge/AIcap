@@ -181,7 +181,22 @@ func main() {
 		}
 
 		bomJSON, _ := json.MarshalIndent(bom, "", "  ")
-		fmt.Println(string(bomJSON))
+
+		// Check for --cyclonedx output flag
+		wantCycloneDX := false
+		for _, arg := range os.Args {
+			if arg == "--cyclonedx" {
+				wantCycloneDX = true
+			}
+		}
+
+		if wantCycloneDX {
+			cdx := generateCycloneDXBOM(bom)
+			cdxJSON, _ := json.MarshalIndent(cdx, "", "  ")
+			fmt.Println(string(cdxJSON))
+		} else {
+			fmt.Println(string(bomJSON))
+		}
 
 		// Phase 7: Sync to SaaS if Pro API Key is present
 		apiKey := os.Getenv("AICAP_API_KEY")
@@ -532,14 +547,75 @@ func main() {
 				return
 			}
 
-			log.Printf("Checkout session completed for customer: %s, UserID: %s", checkoutSession.CustomerEmail, checkoutSession.Metadata["user_id"])
+			userID := checkoutSession.Metadata["user_id"]
+			log.Printf("Checkout completed for customer: %s, UserID: %s", checkoutSession.CustomerEmail, userID)
 
-			// ** IMPORTANT: In a real app, here you would:
-			// 1. Verify payment status and that the user is actually subscribed.
-			// 2. Provision the API Key for checkoutSession.Metadata["user_id"] in your 'api_keys' table.
-			//    For now, API keys are provisioned on first login for simplicity. This can be enhanced later.
+			// Auto-provision API key for the new subscriber
+			if userID != "" {
+				var existingKey string
+				err := db.QueryRow("SELECT token FROM api_keys WHERE user_id = $1", userID).Scan(&existingKey)
+				if err != nil {
+					// No key exists — generate and provision one
+					keyBytes := make([]byte, 24)
+					if _, keyErr := rand.Read(keyBytes); keyErr == nil {
+						apiKey := "aicap_pro_sk_" + hex.EncodeToString(keyBytes)
+						_, insertErr := db.Exec(
+							"INSERT INTO api_keys (user_id, token, stripe_customer_id) VALUES ($1, $2, $3)",
+							userID, apiKey, checkoutSession.Customer.ID,
+						)
+						if insertErr != nil {
+							log.Printf("Failed to provision API key for user %s: %v", userID, insertErr)
+						} else {
+							log.Printf("API key provisioned for user %s", userID)
+						}
+					}
+				} else {
+					log.Printf("User %s already has an API key, skipping provisioning", userID)
+				}
+			}
 
-		// Add handlers for other event types (e.g., 'invoice.payment_succeeded', 'customer.subscription.deleted')
+		case "customer.subscription.deleted":
+			// Subscription cancelled — revoke API access
+			var sub stripe.Subscription
+			if err := json.Unmarshal(event.Data.Raw, &sub); err != nil {
+				log.Printf("Error parsing subscription deleted event: %v", err)
+				break
+			}
+			log.Printf("Subscription deleted for customer: %s", sub.Customer.ID)
+
+			// Revoke the API key associated with this customer
+			result, err := db.Exec("DELETE FROM api_keys WHERE stripe_customer_id = $1", sub.Customer.ID)
+			if err != nil {
+				log.Printf("Failed to revoke API key for customer %s: %v", sub.Customer.ID, err)
+			} else {
+				rowsAffected, _ := result.RowsAffected()
+				log.Printf("Revoked %d API key(s) for customer %s", rowsAffected, sub.Customer.ID)
+			}
+
+		case "invoice.payment_failed":
+			// Payment failed — log it but don't revoke immediately (Stripe retries)
+			var invoice stripe.Invoice
+			if err := json.Unmarshal(event.Data.Raw, &invoice); err != nil {
+				log.Printf("Error parsing invoice event: %v", err)
+				break
+			}
+			log.Printf("Payment failed for customer: %s, invoice: %s, attempt: %d",
+				invoice.Customer.ID, invoice.ID, invoice.AttemptCount)
+
+			// After 3 failed attempts, revoke access
+			if invoice.AttemptCount >= 3 {
+				log.Printf("Max retry attempts reached for customer %s. Revoking API key.", invoice.Customer.ID)
+				db.Exec("DELETE FROM api_keys WHERE stripe_customer_id = $1", invoice.Customer.ID)
+			}
+
+		case "customer.subscription.updated":
+			var sub stripe.Subscription
+			if err := json.Unmarshal(event.Data.Raw, &sub); err != nil {
+				log.Printf("Error parsing subscription update event: %v", err)
+				break
+			}
+			log.Printf("Subscription updated for customer: %s, status: %s", sub.Customer.ID, sub.Status)
+
 		default:
 			log.Printf("Unhandled event type: %s", event.Type)
 		}
@@ -609,27 +685,66 @@ func main() {
 func generateAnnexIVMarkdown(bom AIBOM) string {
 	var sb strings.Builder
 	sb.WriteString("# EU AI Act - Annex IV Technical Documentation\n\n")
+	sb.WriteString(fmt.Sprintf("*Generated: %s*\n\n", time.Now().UTC().Format(time.RFC3339)))
 
+	// Section 1: General Description
 	sb.WriteString("## 1. General System Description (Annex IV, Section 1)\n")
 	sb.WriteString(fmt.Sprintf("- **System Name:** %s\n", bom.ProjectName))
 	sb.WriteString(fmt.Sprintf("- **Version / Commit SHA:** `%s`\n", bom.CommitSha))
+	sb.WriteString(fmt.Sprintf("- **Total Files Scanned:** %d\n", bom.ScannedFiles))
+	sb.WriteString(fmt.Sprintf("- **AI Components Detected:** %d\n", len(bom.Dependencies)))
 	sb.WriteString("- **Intended Purpose:** `[REQUIRES MANUAL INPUT: Describe the exact purpose of this AI system]`\n\n")
 
-	sb.WriteString("## 2. System Architecture & Components (Annex IV, Section 2)\n")
+	// Section 2: Architecture & Components
+	sb.WriteString("## 2. System Architecture & Components (Annex IV, Section 2)\n\n")
+
+	// 2(a): Dependencies grouped by ecosystem
 	sb.WriteString("### 2(a) Pre-trained Systems & Dependencies (AI-BOM)\n")
 	if len(bom.Dependencies) == 0 {
 		sb.WriteString("No AI dependencies detected.\n\n")
 	} else {
+		// Group dependencies by ecosystem for clarity
+		ecosystems := map[string][]AIDependency{}
 		for _, dep := range bom.Dependencies {
-			licenseText := ""
-			if dep.License != "" {
-				licenseText = fmt.Sprintf(" [License: %s]", dep.License)
+			ecosystems[dep.Ecosystem] = append(ecosystems[dep.Ecosystem], dep)
+		}
+		for ecosystem, deps := range ecosystems {
+			sb.WriteString(fmt.Sprintf("\n**%s:**\n", ecosystem))
+			for _, dep := range deps {
+				licenseText := ""
+				if dep.License != "" {
+					licenseText = fmt.Sprintf(" [License: %s]", dep.License)
+				}
+				sb.WriteString(fmt.Sprintf("- **%s** (v%s)%s: %s (Risk: %s)\n", dep.Name, dep.Version, licenseText, dep.Description, dep.RiskLevel))
 			}
-			sb.WriteString(fmt.Sprintf("- **%s** (v%s)%s: %s (Risk: %s)\n", dep.Name, dep.Version, licenseText, dep.Description, dep.RiskLevel))
 		}
 		sb.WriteString("\n")
 	}
 
+	// 2(b): Licensing Summary (auto-generated)
+	sb.WriteString("### 2(b) Licensing Compliance Summary\n")
+	licensedCount := 0
+	unlicensedHighRisk := 0
+	licenseTypes := map[string]int{}
+	for _, dep := range bom.Dependencies {
+		if dep.License != "" {
+			licensedCount++
+			licenseTypes[dep.License]++
+		} else if dep.RiskLevel == "High" {
+			unlicensedHighRisk++
+		}
+	}
+	sb.WriteString(fmt.Sprintf("- **Components with license data:** %d / %d\n", licensedCount, len(bom.Dependencies)))
+	sb.WriteString(fmt.Sprintf("- **High-risk components missing license:** %d\n", unlicensedHighRisk))
+	if len(licenseTypes) > 0 {
+		sb.WriteString("- **License distribution:**\n")
+		for lic, count := range licenseTypes {
+			sb.WriteString(fmt.Sprintf("  - %s: %d component(s)\n", lic, count))
+		}
+	}
+	sb.WriteString("\n")
+
+	// 2(c): Hardware & Infrastructure
 	sb.WriteString("### 2(c) Hardware Requirements & Deployment (FinOps Telemetry)\n")
 	if len(bom.FinOps) == 0 {
 		sb.WriteString("No specific hardware constraints or GPU requests detected in infrastructure manifests.\n\n")
@@ -637,13 +752,72 @@ func generateAnnexIVMarkdown(bom AIBOM) string {
 		for _, fin := range bom.FinOps {
 			sb.WriteString(fmt.Sprintf("- **Resource:** %s\n", fin.Resource))
 			sb.WriteString(fmt.Sprintf("  - **Finding:** %s\n", fin.Description))
+			sb.WriteString(fmt.Sprintf("  - **Severity:** %s\n", fin.Severity))
 		}
 		sb.WriteString("\n")
 	}
 
+	// Section 3: Risk Management
 	sb.WriteString("## 3. Continuous Risk Management (Article 9 & Annex IV, Section 4)\n")
 	sb.WriteString(fmt.Sprintf("**Current Automated Posture:** %s\n\n", bom.Compliance))
-	sb.WriteString("*Automated CI/CD Pipeline Controls:*\n")
+
+	// Auto-generated risk register
+	sb.WriteString("### 3(a) Automated Risk Register\n")
+	highRiskDeps := []AIDependency{}
+	secretFindings := []AIDependency{}
+	for _, dep := range bom.Dependencies {
+		if dep.RiskLevel == "High" && dep.Name != "Exposed Secret" {
+			highRiskDeps = append(highRiskDeps, dep)
+		}
+		if dep.Name == "Exposed Secret" {
+			secretFindings = append(secretFindings, dep)
+		}
+	}
+
+	if len(highRiskDeps) > 0 {
+		sb.WriteString("\n| Component | Risk | Location | Mitigation |\n")
+		sb.WriteString("|---|---|---|---|\n")
+		for _, dep := range highRiskDeps {
+			sb.WriteString(fmt.Sprintf("| %s (v%s) | %s | %s | `[REQUIRES INPUT]` |\n", dep.Name, dep.Version, dep.RiskLevel, dep.Location))
+		}
+		sb.WriteString("\n")
+	} else {
+		sb.WriteString("No high-risk AI components detected.\n\n")
+	}
+
+	if len(secretFindings) > 0 {
+		sb.WriteString(fmt.Sprintf("⚠️ **CRITICAL:** %d exposed secret(s) detected in source code. Immediate remediation required.\n\n", len(secretFindings)))
+	}
+
+	// 3(b): Policy compliance
+	sb.WriteString("### 3(b) Policy-as-Code Compliance\n")
+	if len(bom.PolicyViolations) == 0 {
+		sb.WriteString("- [x] No policy violations detected")
+		sb.WriteString(" (or no `.aicap.yml` policy file configured)\n\n")
+	} else {
+		blockers := 0
+		warnings := 0
+		for _, v := range bom.PolicyViolations {
+			if v.Severity == "Blocker" {
+				blockers++
+			} else {
+				warnings++
+			}
+		}
+		sb.WriteString(fmt.Sprintf("- **Blockers:** %d\n", blockers))
+		sb.WriteString(fmt.Sprintf("- **Warnings:** %d\n\n", warnings))
+		for _, v := range bom.PolicyViolations {
+			icon := "⚠️"
+			if v.Severity == "Blocker" {
+				icon = "🚫"
+			}
+			sb.WriteString(fmt.Sprintf("- %s [%s] %s (%s)\n", icon, v.Rule, v.Description, v.Location))
+		}
+		sb.WriteString("\n")
+	}
+
+	// CI/CD controls
+	sb.WriteString("### 3(c) Automated CI/CD Pipeline Controls\n")
 	if bom.Compliance == "Passed" {
 		sb.WriteString("- [x] High-risk dependency constraints validated.\n")
 	} else {
@@ -651,11 +825,57 @@ func generateAnnexIVMarkdown(bom AIBOM) string {
 	}
 	sb.WriteString("- [ ] `[REQUIRES MANUAL INPUT: Detail prompt injection mitigation strategy]`\n\n")
 
+	// Section 4: Human Oversight
 	sb.WriteString("## 4. Human Oversight & Data Governance (Annex IV, Section 3)\n")
 	sb.WriteString("- **Human-in-the-loop (HITL) Controls:** `[REQUIRES MANUAL INPUT]`\n")
 	sb.WriteString("- **Training Data Provenance:** `[REQUIRES MANUAL INPUT]`\n")
+	sb.WriteString("- **Bias Monitoring:** `[REQUIRES MANUAL INPUT]`\n\n")
+
+	// Section 5: Proof Drill
+	sb.WriteString("## 5. Immutable Compliance Proof (AIcap Proof Drill)\n")
+	sb.WriteString("This document was generated by **AIcap** — an automated AI compliance scanner.\n")
+	sb.WriteString("The AI-BOM, this Annex IV template, and the commit SHA have been cryptographically\n")
+	sb.WriteString("hashed together to create an immutable audit trail.\n\n")
+	sb.WriteString(fmt.Sprintf("- **Commit SHA:** `%s`\n", bom.CommitSha))
+	sb.WriteString(fmt.Sprintf("- **Scan Timestamp:** %s\n", time.Now().UTC().Format(time.RFC3339)))
+	sb.WriteString("- **Cryptographic proof hash available in the AIcap Cloud dashboard.**\n")
 
 	return sb.String()
+}
+
+// CycloneDX SBOM structures — minimal CycloneDX 1.5 compatible output
+type CycloneDXBOM struct {
+	BOMFormat    string              `json:"bomFormat"`
+	SpecVersion  string              `json:"specVersion"`
+	SerialNumber string              `json:"serialNumber"`
+	Version      int                 `json:"version"`
+	Metadata     CycloneDXMetadata   `json:"metadata"`
+	Components   []CycloneDXComponent `json:"components"`
+}
+
+type CycloneDXMetadata struct {
+	Timestamp string              `json:"timestamp"`
+	Component CycloneDXComponent  `json:"component"`
+}
+
+type CycloneDXComponent struct {
+	Type       string              `json:"type"`
+	Name       string              `json:"name"`
+	Version    string              `json:"version,omitempty"`
+	Purl       string              `json:"purl,omitempty"`
+	Licenses   []CycloneDXLicense  `json:"licenses,omitempty"`
+	Properties []CycloneDXProperty `json:"properties,omitempty"`
+}
+
+type CycloneDXLicense struct {
+	License struct {
+		Name string `json:"name"`
+	} `json:"license"`
+}
+
+type CycloneDXProperty struct {
+	Name  string `json:"name"`
+	Value string `json:"value"`
 }
 
 // HFModelResponse maps the JSON response from the Hugging Face API
@@ -733,6 +953,12 @@ func performScan(scanDir string) AIBOM {
 
 			if ext == ".yaml" || ext == ".yml" {
 				finops := parseKubernetesManifest(path)
+				bom.FinOps = append(bom.FinOps, finops...)
+			}
+
+			// Terraform FinOps: parse .tf files for GPU instance types
+			if ext == ".tf" {
+				finops := parseTerraformFile(path)
 				bom.FinOps = append(bom.FinOps, finops...)
 			}
 		}
@@ -1439,5 +1665,155 @@ func parseDockerfile(filePath string) []AIDependency {
 			}
 		}
 	}
+	return found
+}
+
+// generateCycloneDXBOM converts AIcap's AIBOM to CycloneDX 1.5 JSON format
+func generateCycloneDXBOM(bom AIBOM) CycloneDXBOM {
+	components := []CycloneDXComponent{}
+
+	for _, dep := range bom.Dependencies {
+		comp := CycloneDXComponent{
+			Type:    classifyComponentType(dep),
+			Name:    dep.Name,
+			Version: dep.Version,
+			Purl:    generatePURL(dep),
+			Properties: []CycloneDXProperty{
+				{Name: "aicap:riskLevel", Value: dep.RiskLevel},
+				{Name: "aicap:ecosystem", Value: dep.Ecosystem},
+				{Name: "aicap:description", Value: dep.Description},
+			},
+		}
+
+		if dep.Location != "" {
+			comp.Properties = append(comp.Properties, CycloneDXProperty{
+				Name: "aicap:location", Value: dep.Location,
+			})
+		}
+
+		if dep.License != "" {
+			lic := CycloneDXLicense{}
+			lic.License.Name = dep.License
+			comp.Licenses = []CycloneDXLicense{lic}
+		}
+
+		components = append(components, comp)
+	}
+
+	return CycloneDXBOM{
+		BOMFormat:    "CycloneDX",
+		SpecVersion:  "1.5",
+		SerialNumber: "urn:uuid:" + fmt.Sprintf("%x", sha256.Sum256([]byte(bom.ProjectName+bom.CommitSha)))[:36],
+		Version:      1,
+		Metadata: CycloneDXMetadata{
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+			Component: CycloneDXComponent{
+				Type:    "application",
+				Name:    bom.ProjectName,
+				Version: bom.CommitSha,
+			},
+		},
+		Components: components,
+	}
+}
+
+// classifyComponentType maps AIcap dependency types to CycloneDX component types
+func classifyComponentType(dep AIDependency) string {
+	if strings.HasPrefix(dep.Ecosystem, "Model Weight") || strings.HasPrefix(dep.Ecosystem, "Container Image") {
+		return "machine-learning-model"
+	}
+	if dep.Name == "Exposed Secret" {
+		return "data"
+	}
+	return "library"
+}
+
+// generatePURL creates a Package URL for the dependency
+func generatePURL(dep AIDependency) string {
+	switch {
+	case strings.Contains(dep.Ecosystem, "pip") || strings.Contains(dep.Ecosystem, "Poetry"):
+		return fmt.Sprintf("pkg:pypi/%s@%s", dep.Name, dep.Version)
+	case strings.Contains(dep.Ecosystem, "npm"):
+		return fmt.Sprintf("pkg:npm/%s@%s", dep.Name, dep.Version)
+	case strings.Contains(dep.Ecosystem, "Go"):
+		return fmt.Sprintf("pkg:golang/%s@%s", dep.Name, dep.Version)
+	case strings.Contains(dep.Ecosystem, "Dockerfile"):
+		return fmt.Sprintf("pkg:docker/%s", dep.Name)
+	default:
+		return ""
+	}
+}
+
+// parseTerraformFile analyzes .tf files for GPU instance types and cost optimization opportunities
+func parseTerraformFile(filePath string) []FinOpsFinding {
+	var found []FinOpsFinding
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		return found
+	}
+
+	content := strings.ToLower(string(data))
+
+	// AWS GPU instance families
+	awsGPUInstances := map[string]string{
+		"p3.":    "NVIDIA V100 GPU (p3) — $3.06-$24.48/hr",
+		"p4d.":   "NVIDIA A100 GPU (p4d) — $32.77/hr",
+		"p4de.":  "NVIDIA A100 80GB GPU (p4de) — $40.97/hr",
+		"p5.":    "NVIDIA H100 GPU (p5) — $98.32/hr",
+		"g4dn.":  "NVIDIA T4 GPU (g4dn) — $0.53-$7.82/hr",
+		"g5.":    "NVIDIA A10G GPU (g5) — $1.01-$16.29/hr",
+		"g5g.":   "AWS Graviton GPU (g5g) — $0.42-$2.74/hr",
+		"g6.":    "NVIDIA L4 GPU (g6) — $0.80-$13.35/hr",
+		"inf1.":  "AWS Inferentia (inf1) — $0.23-$4.72/hr",
+		"inf2.":  "AWS Inferentia2 (inf2) — $0.76-$12.98/hr",
+		"trn1.":  "AWS Trainium (trn1) — $1.34-$21.50/hr",
+	}
+
+	// Azure GPU instance families
+	azureGPUInstances := map[string]string{
+		"standard_nc":  "NVIDIA T4/V100 GPU (NC-series)",
+		"standard_nd":  "NVIDIA A100/H100 GPU (ND-series)",
+		"standard_nv":  "NVIDIA GPU for visualization (NV-series)",
+	}
+
+	// GCP GPU instance families
+	gcpGPUInstances := map[string]string{
+		"a2-highgpu":    "NVIDIA A100 GPU (a2-highgpu)",
+		"a2-megagpu":    "NVIDIA A100 80GB GPU (a2-megagpu)",
+		"g2-standard":   "NVIDIA L4 GPU (g2-standard)",
+		"a3-highgpu":    "NVIDIA H100 GPU (a3-highgpu)",
+	}
+
+	checkInstances := func(instances map[string]string, cloud string) {
+		for instanceType, desc := range instances {
+			if strings.Contains(content, instanceType) {
+				// Check for spot/preemptible configurations
+				hasSpot := strings.Contains(content, "spot") ||
+					strings.Contains(content, "preemptible") ||
+					strings.Contains(content, "capacity_type") && strings.Contains(content, "spot")
+
+				severity := "Warning"
+				description := fmt.Sprintf("%s instance detected in Terraform config: %s.", cloud, desc)
+				if !hasSpot {
+					description += " Consider using spot/preemptible instances for 60-90%% cost savings on non-critical workloads."
+				} else {
+					severity = "Info"
+					description += " Spot/preemptible pricing detected — good cost optimization."
+				}
+
+				found = append(found, FinOpsFinding{
+					Resource:    filepath.Base(filePath),
+					Severity:    severity,
+					Description: description,
+					Location:    filePath,
+				})
+			}
+		}
+	}
+
+	checkInstances(awsGPUInstances, "AWS")
+	checkInstances(azureGPUInstances, "Azure")
+	checkInstances(gcpGPUInstances, "GCP")
+
 	return found
 }

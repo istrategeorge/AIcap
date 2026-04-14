@@ -602,3 +602,190 @@ func TestAIBOM_JSONSerialization(t *testing.T) {
 		t.Errorf("Expected 1 policy violation, got %d", len(decoded.PolicyViolations))
 	}
 }
+
+// --- parseTerraformFile Tests ---
+
+func TestParseTerraformFile_DetectsAWSGPUInstances(t *testing.T) {
+	content := `resource "aws_instance" "training" {
+  ami           = "ami-0abcdef"
+  instance_type = "p4d.24xlarge"
+}
+`
+	path := createTempFile(t, "main.tf", content)
+	findings := parseTerraformFile(path)
+
+	if len(findings) == 0 {
+		t.Fatal("Expected at least 1 FinOps finding for p4d GPU instance")
+	}
+
+	found := false
+	for _, f := range findings {
+		if strings.Contains(f.Description, "AWS") && strings.Contains(f.Description, "A100") {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("Expected AWS A100 GPU finding for p4d instance")
+	}
+}
+
+func TestParseTerraformFile_DetectsSpotPricing(t *testing.T) {
+	content := `resource "aws_instance" "training" {
+  instance_type = "g5.xlarge"
+  capacity_type = "spot"
+}
+`
+	path := createTempFile(t, "main.tf", content)
+	findings := parseTerraformFile(path)
+
+	for _, f := range findings {
+		if strings.Contains(f.Description, "g5") && f.Severity != "Info" {
+			t.Errorf("Expected Info severity for spot instance, got '%s'", f.Severity)
+		}
+	}
+}
+
+func TestParseTerraformFile_NoGPU(t *testing.T) {
+	content := `resource "aws_instance" "web" {
+  ami           = "ami-0abcdef"
+  instance_type = "t3.micro"
+}
+`
+	path := createTempFile(t, "main.tf", content)
+	findings := parseTerraformFile(path)
+	if len(findings) != 0 {
+		t.Errorf("Expected 0 findings for non-GPU instance, got %d", len(findings))
+	}
+}
+
+func TestParseTerraformFile_DetectsAzureGPU(t *testing.T) {
+	content := `resource "azurerm_virtual_machine" "gpu" {
+  vm_size = "Standard_NC6s_v3"
+}
+`
+	path := createTempFile(t, "azure.tf", content)
+	findings := parseTerraformFile(path)
+	if len(findings) == 0 {
+		t.Fatal("Expected Azure GPU finding for Standard_NC instance")
+	}
+}
+
+// --- CycloneDX Tests ---
+
+func TestGenerateCycloneDXBOM_ValidFormat(t *testing.T) {
+	bom := AIBOM{
+		ProjectName: "test-project",
+		CommitSha:   "abc123",
+		Dependencies: []AIDependency{
+			{Name: "openai", Version: "1.12.0", Ecosystem: "Python (pip)", RiskLevel: "High", License: "MIT"},
+			{Name: "Hardcoded Model", Version: "gpt-4", Ecosystem: "Source Code (.py)", RiskLevel: "High"},
+		},
+	}
+
+	cdx := generateCycloneDXBOM(bom)
+
+	if cdx.BOMFormat != "CycloneDX" {
+		t.Errorf("Expected bomFormat 'CycloneDX', got '%s'", cdx.BOMFormat)
+	}
+	if cdx.SpecVersion != "1.5" {
+		t.Errorf("Expected specVersion '1.5', got '%s'", cdx.SpecVersion)
+	}
+	if len(cdx.Components) != 2 {
+		t.Fatalf("Expected 2 components, got %d", len(cdx.Components))
+	}
+	if cdx.Metadata.Component.Name != "test-project" {
+		t.Errorf("Expected metadata component name 'test-project', got '%s'", cdx.Metadata.Component.Name)
+	}
+}
+
+func TestGenerateCycloneDXBOM_HasPURL(t *testing.T) {
+	bom := AIBOM{
+		Dependencies: []AIDependency{
+			{Name: "openai", Version: "1.12.0", Ecosystem: "Python (pip)"},
+			{Name: "langchain", Version: "0.1.5", Ecosystem: "Node.js (npm)"},
+			{Name: "go-openai", Version: "1.20.4", Ecosystem: "Go (module)"},
+		},
+	}
+
+	cdx := generateCycloneDXBOM(bom)
+
+	purls := map[string]string{}
+	for _, comp := range cdx.Components {
+		purls[comp.Name] = comp.Purl
+	}
+
+	if purls["openai"] != "pkg:pypi/openai@1.12.0" {
+		t.Errorf("Expected PyPI PURL, got '%s'", purls["openai"])
+	}
+	if purls["langchain"] != "pkg:npm/langchain@0.1.5" {
+		t.Errorf("Expected npm PURL, got '%s'", purls["langchain"])
+	}
+	if purls["go-openai"] != "pkg:golang/go-openai@1.20.4" {
+		t.Errorf("Expected Go PURL, got '%s'", purls["go-openai"])
+	}
+}
+
+func TestClassifyComponentType(t *testing.T) {
+	tests := []struct {
+		dep      AIDependency
+		expected string
+	}{
+		{AIDependency{Ecosystem: "Model Weight (.safetensors)"}, "machine-learning-model"},
+		{AIDependency{Ecosystem: "Container Image (Dockerfile)"}, "machine-learning-model"},
+		{AIDependency{Name: "Exposed Secret", Ecosystem: "Source Code (.py)"}, "data"},
+		{AIDependency{Name: "openai", Ecosystem: "Python (pip)"}, "library"},
+	}
+
+	for _, tt := range tests {
+		result := classifyComponentType(tt.dep)
+		if result != tt.expected {
+			t.Errorf("classifyComponentType(%s) = '%s', want '%s'", tt.dep.Name, result, tt.expected)
+		}
+	}
+}
+
+// --- Enhanced Annex IV Tests ---
+
+func TestGenerateAnnexIVMarkdown_ContainsAllSections(t *testing.T) {
+	bom := AIBOM{
+		ProjectName:  "test-project",
+		CommitSha:    "abc123",
+		ScannedFiles: 10,
+		Dependencies: []AIDependency{
+			{Name: "openai", Version: "1.0", Ecosystem: "Python (pip)", RiskLevel: "High", License: "MIT"},
+			{Name: "Exposed Secret", Version: "HIDDEN", Ecosystem: "Source Code (.py)", RiskLevel: "High"},
+		},
+		FinOps: []FinOpsFinding{
+			{Resource: "main.tf", Severity: "Warning", Description: "GPU detected"},
+		},
+		PolicyViolations: []PolicyViolation{
+			{Rule: "test_rule", Severity: "Warning", Description: "test violation", Location: "test.py:1"},
+		},
+		Compliance: "Action Required",
+	}
+
+	md := generateAnnexIVMarkdown(bom)
+
+	requiredSections := []string{
+		"Annex IV Technical Documentation",
+		"General System Description",
+		"System Architecture",
+		"Licensing Compliance Summary",
+		"Hardware Requirements",
+		"Risk Management",
+		"Automated Risk Register",
+		"Policy-as-Code Compliance",
+		"CI/CD Pipeline Controls",
+		"Human Oversight",
+		"Immutable Compliance Proof",
+		"Components with license data",
+		"CRITICAL",
+	}
+
+	for _, section := range requiredSections {
+		if !strings.Contains(md, section) {
+			t.Errorf("Annex IV markdown missing required section: '%s'", section)
+		}
+	}
+}
+
