@@ -435,6 +435,11 @@ func main() {
 			priceID = os.Getenv("STRIPE_PRICE_ID")
 		}
 
+		frontendURL := os.Getenv("VITE_FRONTEND_URL")
+		if frontendURL == "" {
+			frontendURL = "http://localhost:5173" // fallback for local testing
+		}
+
 		params := &stripe.CheckoutSessionParams{
 			LineItems: []*stripe.CheckoutSessionLineItemParams{
 				{
@@ -443,22 +448,22 @@ func main() {
 				},
 			},
 			Mode:          stripe.String(string(stripe.CheckoutSessionModeSubscription)),
-			SuccessURL:    stripe.String(os.Getenv("VITE_FRONTEND_URL") + "/success?session_id={CHECKOUT_SESSION_ID}"),
-			CancelURL:     stripe.String(os.Getenv("VITE_FRONTEND_URL") + "/cancel"),
+			SuccessURL:    stripe.String(frontendURL + "/?session_id={CHECKOUT_SESSION_ID}"),
+			CancelURL:     stripe.String(frontendURL + "/"),
 			CustomerEmail: stripe.String(requestBody.UserEmail),
 			Metadata: map[string]string{
 				"user_id": requestBody.UserID,
 			},
 		}
 
-		session, err := session.New(params)
+		checkoutSession, err := session.New(params)
 		if err != nil {
 			log.Printf("Error creating checkout session: %v", err)
-			http.Error(w, "Failed to create checkout session", http.StatusInternalServerError)
+			http.Error(w, fmt.Sprintf("Stripe Error: %v", err), http.StatusInternalServerError)
 			return
 		}
 
-		json.NewEncoder(w).Encode(map[string]string{"sessionId": session.ID, "url": session.URL})
+		json.NewEncoder(w).Encode(map[string]string{"sessionId": checkoutSession.ID, "url": checkoutSession.URL})
 	})
 
 	// Stripe Webhook Handler
