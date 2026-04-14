@@ -221,7 +221,10 @@ export default function App() {
         body: JSON.stringify({ userEmail: session.user.email, userID: session.user.id })
       });
 
-      if (!response.ok) throw new Error("Failed to initialize checkout");
+      if (!response.ok) {
+        const errText = await response.text();
+        throw new Error(`Checkout Error: ${errText}`);
+      }
 
       const data = await response.json();
       if (data.url) {
