@@ -789,3 +789,219 @@ func TestGenerateAnnexIVMarkdown_ContainsAllSections(t *testing.T) {
 	}
 }
 
+// --- Python Import Detection Tests ---
+
+func TestParsePythonSource_DetectsImportStatements(t *testing.T) {
+	content := `import torch
+from langchain.llms import OpenAI
+import os
+`
+	path := createTempFile(t, "app.py", content)
+	deps := parsePythonSource(path)
+
+	importedLibs := map[string]bool{}
+	for _, d := range deps {
+		if d.Ecosystem == "Source Code (.py import)" {
+			importedLibs[d.Name] = true
+		}
+	}
+
+	if !importedLibs["torch"] {
+		t.Error("Expected to detect 'import torch'")
+	}
+	if !importedLibs["langchain"] {
+		t.Error("Expected to detect 'from langchain import'")
+	}
+}
+
+func TestParsePythonSource_DeduplicatesImports(t *testing.T) {
+	content := `import torch
+import torch
+from torch import nn
+`
+	path := createTempFile(t, "dup.py", content)
+	deps := parsePythonSource(path)
+
+	importCount := 0
+	for _, d := range deps {
+		if d.Ecosystem == "Source Code (.py import)" && d.Name == "torch" {
+			importCount++
+		}
+	}
+	if importCount > 1 {
+		t.Errorf("Expected deduplicated imports, got %d 'torch' import detections", importCount)
+	}
+}
+
+// --- parseEnvFile Tests ---
+
+func TestParseEnvFile_DetectsOpenAIKey(t *testing.T) {
+	content := `# API Keys
+DATABASE_URL=postgres://localhost/db
+OPENAI_API_KEY=sk-1234567890abcdefghijklmnop
+PORT=8080
+`
+	path := createTempFile(t, ".env", content)
+	deps := parseEnvFile(path)
+
+	if len(deps) == 0 {
+		t.Fatal("Expected to detect OpenAI API key in .env")
+	}
+
+	hasOpenAI := false
+	for _, d := range deps {
+		if strings.Contains(d.Description, "OpenAI") {
+			hasOpenAI = true
+		}
+	}
+	if !hasOpenAI {
+		t.Error("Expected OpenAI platform detection in .env")
+	}
+}
+
+func TestParseEnvFile_SkipsPlaceholders(t *testing.T) {
+	content := `OPENAI_API_KEY=your-key-here
+HF_TOKEN=${HF_TOKEN}
+ANTHROPIC_API_KEY=<replace-with-your-key>
+`
+	path := createTempFile(t, ".env", content)
+	deps := parseEnvFile(path)
+
+	if len(deps) != 0 {
+		t.Errorf("Expected 0 findings for placeholder values, got %d: %+v", len(deps), deps)
+	}
+}
+
+func TestParseEnvFile_DetectsMultiplePlatforms(t *testing.T) {
+	content := `OPENAI_API_KEY=sk-abc1234567890abcdefghijk
+HF_TOKEN=hf_abc1234567890abcdefghijk
+WANDB_API_KEY=wand_1234567890abcdefghijk
+`
+	path := createTempFile(t, ".env", content)
+	deps := parseEnvFile(path)
+
+	if len(deps) < 2 {
+		t.Errorf("Expected at least 2 secret findings, got %d", len(deps))
+	}
+}
+
+func TestParseEnvFile_CleanFile(t *testing.T) {
+	content := `PORT=8080
+DATABASE_URL=postgres://localhost/db
+DEBUG=true
+`
+	path := createTempFile(t, ".env", content)
+	deps := parseEnvFile(path)
+	if len(deps) != 0 {
+		t.Errorf("Expected 0 findings in clean .env, got %d", len(deps))
+	}
+}
+
+// --- Helm Values Tests ---
+
+func TestParseHelmValues_DetectsGPUWithoutAutoscaling(t *testing.T) {
+	content := `replicaCount: 2
+
+resources:
+  limits:
+    nvidia.com/gpu: 1
+    memory: "16Gi"
+`
+	path := createTempFile(t, "values.yaml", content)
+	findings := parseHelmValues(path)
+
+	if len(findings) == 0 {
+		t.Fatal("Expected FinOps finding for GPU without autoscaling")
+	}
+
+	found := false
+	for _, f := range findings {
+		if f.Severity == "Warning" && strings.Contains(f.Description, "GPU") {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("Expected Warning severity for GPU without autoscaling")
+	}
+}
+
+func TestParseHelmValues_DetectsGPUWithAutoscaling(t *testing.T) {
+	content := `resources:
+  limits:
+    nvidia.com/gpu: 1
+
+autoscaling:
+  enabled: true
+  minReplicas: 1
+  maxReplicas: 4
+`
+	path := createTempFile(t, "values.yaml", content)
+	findings := parseHelmValues(path)
+
+	for _, f := range findings {
+		if strings.Contains(f.Description, "GPU") && f.Severity != "Info" {
+			t.Errorf("Expected Info severity when autoscaling is configured, got '%s'", f.Severity)
+		}
+	}
+}
+
+func TestParseHelmValues_DetectsModelServing(t *testing.T) {
+	content := `image: nvcr.io/nvidia/tritonserver:23.10-py3
+modelRepository: /models
+`
+	path := createTempFile(t, "values.yaml", content)
+	findings := parseHelmValues(path)
+
+	found := false
+	for _, f := range findings {
+		if strings.Contains(f.Description, "model serving") {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("Expected model serving detection for tritonserver config")
+	}
+}
+
+// --- OWASP ML Risk Enrichment Tests ---
+
+func TestEnrichWithOWASPRisks_AddsAnnotations(t *testing.T) {
+	bom := AIBOM{
+		Dependencies: []AIDependency{
+			{Name: "openai", Version: "1.0", Description: "External LLM API Call (OpenAI)"},
+			{Name: "langchain", Version: "0.1", Description: "LLM Orchestration Framework"},
+			{Name: "flask", Version: "3.0", Description: "Web Framework"},
+		},
+	}
+
+	enrichWithOWASPRisks(&bom)
+
+	if !strings.Contains(bom.Dependencies[0].Description, "OWASP") {
+		t.Error("Expected OWASP annotation on openai dependency")
+	}
+	if !strings.Contains(bom.Dependencies[0].Description, "ML06") {
+		t.Error("Expected ML06 (Supply Chain Attacks) for openai")
+	}
+	if !strings.Contains(bom.Dependencies[1].Description, "ML01") {
+		t.Error("Expected ML01 (Input Manipulation) for langchain")
+	}
+	if strings.Contains(bom.Dependencies[2].Description, "OWASP") {
+		t.Error("Flask should not have OWASP ML annotations")
+	}
+}
+
+func TestEnrichWithOWASPRisks_NoDuplicateAnnotations(t *testing.T) {
+	bom := AIBOM{
+		Dependencies: []AIDependency{
+			{Name: "openai", Version: "1.0", Description: "Already has OWASP ML annotation"},
+		},
+	}
+
+	enrichWithOWASPRisks(&bom)
+	enrichWithOWASPRisks(&bom) // call twice
+
+	count := strings.Count(bom.Dependencies[0].Description, "OWASP")
+	if count > 1 {
+		t.Errorf("Expected no duplicate OWASP annotations, got %d occurrences", count)
+	}
+}

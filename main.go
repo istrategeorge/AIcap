@@ -934,6 +934,12 @@ func performScan(scanDir string) AIBOM {
 				bom.Dependencies = append(bom.Dependencies, deps...)
 			}
 
+			// Scan .env files for leaked secrets
+			if info.Name() == ".env" || strings.HasSuffix(info.Name(), ".env") {
+				deps := parseEnvFile(path)
+				bom.Dependencies = append(bom.Dependencies, deps...)
+			}
+
 			ext := strings.ToLower(filepath.Ext(info.Name()))
 			isModelWeight := false
 			switch ext {
@@ -954,6 +960,11 @@ func performScan(scanDir string) AIBOM {
 			if ext == ".yaml" || ext == ".yml" {
 				finops := parseKubernetesManifest(path)
 				bom.FinOps = append(bom.FinOps, finops...)
+				// Also check for Helm values with GPU resources
+				if info.Name() == "values.yaml" || info.Name() == "values.yml" {
+					helmFinOps := parseHelmValues(path)
+					bom.FinOps = append(bom.FinOps, helmFinOps...)
+				}
 			}
 
 			// Terraform FinOps: parse .tf files for GPU instance types
@@ -1004,6 +1015,9 @@ func performScan(scanDir string) AIBOM {
 			}
 		}
 	}
+	// Phase: OWASP ML Top 10 Risk Enrichment
+	// Cross-reference detected dependencies with known ML attack vectors
+	enrichWithOWASPRisks(&bom)
 
 	// Phase: Policy-as-Code Evaluation
 	// Load .aicap.yml policy if it exists in the scanned directory
@@ -1280,7 +1294,7 @@ func parsePackageJson(filePath string) []AIDependency {
 	return found
 }
 
-// parsePythonSource uses heuristic regex matching to find string literals in Python files
+// parsePythonSource uses heuristic regex matching to find string literals AND import statements in Python files
 func parsePythonSource(filePath string) []AIDependency {
 	var found []AIDependency
 	file, err := os.Open(filePath)
@@ -1290,14 +1304,39 @@ func parsePythonSource(filePath string) []AIDependency {
 	defer file.Close()
 
 	scanner := bufio.NewScanner(file)
-	// Regex to match string literals inside single or double quotes (Go's regexp does not support backreferences like \1)
+	// Regex to match string literals inside single or double quotes
 	strRegex := regexp.MustCompile(`"([^"]*)"|'([^']*)'`)
+	// Regex to match "import X" or "from X import Y" patterns
+	importRegex := regexp.MustCompile(`^\s*(?:import\s+([a-zA-Z0-9_]+)|from\s+([a-zA-Z0-9_]+)(?:\.[a-zA-Z0-9_.]+)?\s+import)`)
 
+	detectedImports := map[string]bool{} // deduplicate
 	lineNum := 1
 	for scanner.Scan() {
 		line := scanner.Text()
-		matches := strRegex.FindAllStringSubmatch(line, -1)
 
+		// Detect Python import statements for AI libraries
+		importMatches := importRegex.FindStringSubmatch(line)
+		if len(importMatches) > 0 {
+			modName := importMatches[1]
+			if modName == "" {
+				modName = importMatches[2]
+			}
+			modName = strings.ToLower(modName)
+			if meta, exists := targetAILibraries[modName]; exists && !detectedImports[modName] {
+				detectedImports[modName] = true
+				found = append(found, AIDependency{
+					Name:        modName,
+					Version:     "imported",
+					Ecosystem:   "Source Code (.py import)",
+					RiskLevel:   meta.Risk,
+					Description: meta.Desc + " (detected via import statement)",
+					Location:    fmt.Sprintf("%s:%d", filePath, lineNum),
+				})
+			}
+		}
+
+		// Detect hardcoded model strings and secrets
+		matches := strRegex.FindAllStringSubmatch(line, -1)
 		for _, match := range matches {
 			if len(match) > 2 {
 				val := match[1]
@@ -1816,4 +1855,191 @@ func parseTerraformFile(filePath string) []FinOpsFinding {
 	checkInstances(gcpGPUInstances, "GCP")
 
 	return found
+}
+
+// parseEnvFile scans .env files for exposed AI platform API keys and secrets
+func parseEnvFile(filePath string) []AIDependency {
+	var found []AIDependency
+	file, err := os.Open(filePath)
+	if err != nil {
+		return found
+	}
+	defer file.Close()
+
+	// Sensitive key patterns for AI/ML platforms
+	sensitivePatterns := map[string]string{
+		"sk-":                     "OpenAI API Key",
+		"sk-ant-":                 "Anthropic API Key",
+		"hf_":                     "Hugging Face API Token",
+		"AIza":                    "Google AI API Key",
+		"AKIA":                    "AWS Access Key (potential SageMaker/Bedrock)",
+		"r8_":                     "Replicate API Token",
+		"xai-":                    "xAI (Grok) API Key",
+	}
+
+	// Also check key names that hint at AI services
+	sensitiveKeyNames := map[string]string{
+		"OPENAI_API_KEY":          "OpenAI",
+		"ANTHROPIC_API_KEY":       "Anthropic",
+		"HUGGINGFACE_TOKEN":       "Hugging Face",
+		"HF_TOKEN":                "Hugging Face",
+		"GOOGLE_AI_API_KEY":       "Google AI",
+		"COHERE_API_KEY":          "Cohere",
+		"REPLICATE_API_TOKEN":     "Replicate",
+		"AZURE_OPENAI_API_KEY":    "Azure OpenAI",
+		"AWS_SECRET_ACCESS_KEY":   "AWS (SageMaker/Bedrock)",
+		"WANDB_API_KEY":           "Weights & Biases",
+		"LANGCHAIN_API_KEY":       "LangChain/LangSmith",
+		"PINECONE_API_KEY":        "Pinecone Vector DB",
+		"TOGETHER_API_KEY":        "Together AI",
+	}
+
+	scanner := bufio.NewScanner(file)
+	lineNum := 0
+	for scanner.Scan() {
+		lineNum++
+		line := strings.TrimSpace(scanner.Text())
+
+		// Skip comments and empty
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		keyName := strings.TrimSpace(parts[0])
+		keyValue := strings.TrimSpace(parts[1])
+		keyValue = strings.Trim(keyValue, "\"'")
+
+		// Check if the variable name suggests an AI API key
+		if platform, isAIKey := sensitiveKeyNames[strings.ToUpper(keyName)]; isAIKey {
+			if keyValue != "" && keyValue != "your-key-here" && !strings.HasPrefix(keyValue, "${") && !strings.HasPrefix(keyValue, "<") {
+				found = append(found, AIDependency{
+					Name:        "Exposed Secret",
+					Version:     "HIDDEN",
+					Ecosystem:   "Environment File (.env)",
+					RiskLevel:   "High",
+					Description: fmt.Sprintf("%s API key found in .env file — should be in a secret manager, not committed to VCS", platform),
+					Location:    fmt.Sprintf("%s:%d", filePath, lineNum),
+				})
+			}
+		}
+
+		// Check if the value matches a known secret pattern
+		for prefix, platform := range sensitivePatterns {
+			if strings.HasPrefix(keyValue, prefix) && len(keyValue) > 20 {
+				found = append(found, AIDependency{
+					Name:        "Exposed Secret",
+					Version:     "HIDDEN",
+					Ecosystem:   "Environment File (.env)",
+					RiskLevel:   "High",
+					Description: fmt.Sprintf("%s detected in .env file — rotate this key immediately", platform),
+					Location:    fmt.Sprintf("%s:%d", filePath, lineNum),
+				})
+				break // avoid double-flagging
+			}
+		}
+	}
+	return found
+}
+
+// parseHelmValues analyzes Helm values.yaml for GPU resource requests and AI model serving configs
+func parseHelmValues(filePath string) []FinOpsFinding {
+	var found []FinOpsFinding
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		return found
+	}
+
+	content := strings.ToLower(string(data))
+	lines := strings.Split(content, "\n")
+
+	hasGPU := false
+	hasModelServing := false
+	hasAutoscaling := false
+
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+
+		// Detect GPU resource requests
+		if strings.Contains(trimmed, "nvidia.com/gpu") || strings.Contains(trimmed, "amd.com/gpu") {
+			hasGPU = true
+		}
+
+		// Detect model serving frameworks
+		modelServingPatterns := []string{
+			"tritonserver", "tensorflow-serving", "torchserve", "seldon",
+			"kserve", "mlflow", "bentoml", "ray-serve", "vllm",
+		}
+		for _, pattern := range modelServingPatterns {
+			if strings.Contains(trimmed, pattern) {
+				hasModelServing = true
+			}
+		}
+
+		// Detect autoscaling configuration
+		if strings.Contains(trimmed, "autoscaling") || strings.Contains(trimmed, "hpa") || strings.Contains(trimmed, "minreplicas") {
+			hasAutoscaling = true
+		}
+	}
+
+	if hasGPU {
+		severity := "Warning"
+		desc := "GPU resource requests detected in Helm values. "
+		if !hasAutoscaling {
+			desc += "No autoscaling configuration found — fixed GPU allocation may lead to cost waste during low-traffic periods."
+		} else {
+			severity = "Info"
+			desc += "Autoscaling is configured — good cost optimization practice."
+		}
+		found = append(found, FinOpsFinding{
+			Resource:    filepath.Base(filePath),
+			Severity:    severity,
+			Description: desc,
+			Location:    filePath,
+		})
+	}
+
+	if hasModelServing {
+		found = append(found, FinOpsFinding{
+			Resource:    filepath.Base(filePath),
+			Severity:    "Info",
+			Description: "AI model serving framework configuration detected in Helm values. Consider batching inference requests for GPU utilization optimization.",
+			Location:    filePath,
+		})
+	}
+
+	return found
+}
+
+// owaspMLRisks provides a static mapping of detected dependencies to OWASP Machine Learning Top 10 risks
+// This enriches the compliance report with known attack vectors
+var owaspMLRisks = map[string][]string{
+	"openai":       {"ML06:2023 AI Supply Chain Attacks - External LLM API dependency creates supply chain risk"},
+	"anthropic":    {"ML06:2023 AI Supply Chain Attacks - External LLM API dependency creates supply chain risk"},
+	"langchain":    {"ML01:2023 Input Manipulation - LLM orchestration framework susceptible to prompt injection", "ML06:2023 AI Supply Chain Attacks - Third-party orchestration framework creates supply chain risk"},
+	"torch":        {"ML04:2023 Model Theft - Local model weights may be extractable", "ML08:2023 Model Skewing - Training pipeline integrity must be verified"},
+	"tensorflow":   {"ML04:2023 Model Theft - Local model weights may be extractable", "ML08:2023 Model Skewing - Training pipeline integrity must be verified"},
+	"transformers": {"ML06:2023 AI Supply Chain Attacks - Pre-trained model supply chain risk", "ML02:2023 Data Poisoning - Pre-trained models may contain poisoned weights"},
+	"scikit-learn": {"ML08:2023 Model Skewing - Ensure training data distributions are monitored"},
+	"ollama":       {"ML04:2023 Model Theft - Local model hosting increases model exfiltration surface"},
+	"chromadb":     {"ML09:2023 Output Integrity - Vector DB poisoning can corrupt RAG retrieval results"},
+	"pinecone":     {"ML09:2023 Output Integrity - Vector DB poisoning can corrupt RAG retrieval results"},
+}
+
+// enrichWithOWASPRisks adds OWASP ML Top 10 risk annotations to the AIBOM
+func enrichWithOWASPRisks(bom *AIBOM) {
+	for i, dep := range bom.Dependencies {
+		depNameLower := strings.ToLower(dep.Name)
+		if risks, ok := owaspMLRisks[depNameLower]; ok {
+			// Append OWASP risks to the description
+			owaspNote := " | OWASP ML: " + strings.Join(risks, "; ")
+			// Only add if not already annotated
+			if !strings.Contains(bom.Dependencies[i].Description, "OWASP") {
+				bom.Dependencies[i].Description += owaspNote
+			}
+		}
+	}
 }
