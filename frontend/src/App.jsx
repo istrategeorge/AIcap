@@ -85,10 +85,21 @@ export default function App() {
       const urlParams = new URLSearchParams(window.location.search);
       const sessionId = urlParams.get('session_id');
 
-      // Auto-provision key if they just returned from a successful Stripe checkout
+      // Auto-provision key server-side if they just returned from a successful Stripe checkout
       if (!apiKey && sessionId) {
-        apiKey = "aicap_pro_sk_" + Math.random().toString(36).substring(2, 15) + "9x";
-        await supabase.from('api_keys').insert([{ user_id: user.id, token: apiKey }]);
+        try {
+          const response = await fetch(`${API_BASE_URL}/api/generate-key`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ userID: user.id })
+          });
+          if (response.ok) {
+            const data = await response.json();
+            apiKey = data.apiKey;
+          }
+        } catch (keyError) {
+          console.error("Failed to generate API key:", keyError);
+        }
         window.history.replaceState({}, document.title, "/"); // Clean up the URL
       }
 
@@ -177,21 +188,22 @@ export default function App() {
     setAuthForm({ ...authForm, loading: true });
     
     try {
+      let authError = null;
       if (isSignUp) {
         const { error } = await supabase.auth.signUp({
           email: authForm.email,
           password: authForm.password,
         });
-        if (error) throw error;
+        authError = error;
       } else {
         const { error } = await supabase.auth.signInWithPassword({
           email: authForm.email,
           password: authForm.password,
         });
-        if (error) throw error;
+        authError = error;
       }
 
-      if (error) throw error;
+      if (authError) throw authError;
 
     } catch (err) {
       alert(err.message);

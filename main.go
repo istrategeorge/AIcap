@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
 	"embed"
@@ -48,12 +49,31 @@ type FinOpsFinding struct {
 
 // AIBOM represents the final Software Bill of Materials for AI
 type AIBOM struct {
-	ProjectName  string          `json:"projectName"`
-	CommitSha    string          `json:"commitSha,omitempty"`
-	ScannedFiles int             `json:"scannedFiles"`
-	Dependencies []AIDependency  `json:"dependencies"`
-	FinOps       []FinOpsFinding `json:"finOps"`
-	Compliance   string          `json:"complianceStatus"`
+	ProjectName      string            `json:"projectName"`
+	CommitSha        string            `json:"commitSha,omitempty"`
+	ScannedFiles     int               `json:"scannedFiles"`
+	Dependencies     []AIDependency    `json:"dependencies"`
+	FinOps           []FinOpsFinding   `json:"finOps"`
+	PolicyViolations []PolicyViolation `json:"policyViolations,omitempty"`
+	Compliance       string            `json:"complianceStatus"`
+}
+
+// PolicyViolation represents a policy-as-code rule violation
+type PolicyViolation struct {
+	Rule        string `json:"rule"`
+	Severity    string `json:"severity"`
+	Description string `json:"description"`
+	Location    string `json:"location,omitempty"`
+}
+
+// PolicyConfig represents the .aicap.yml policy-as-code configuration
+type PolicyConfig struct {
+	AllowedModels    []string `json:"allowedModels"`
+	BlockedModels    []string `json:"blockedModels"`
+	MaxRiskLevel     string   `json:"maxRiskLevel"`
+	BlockOnHighRisk  bool     `json:"blockOnHighRisk"`
+	RequireLicenses  bool     `json:"requireLicenses"`
+	AllowedLicenses  []string `json:"allowedLicenses"`
 }
 
 // Map of known AI libraries and their assumed regulatory risk (MVP level)
@@ -108,7 +128,9 @@ func init() {
 			"transformers": {"High", "Hugging Face Transformers"},
 		}
 	} else {
-		json.Unmarshal(libFile, &targetAILibraries)
+		if err := json.Unmarshal(libFile, &targetAILibraries); err != nil {
+			log.Printf("Error parsing libraries.json: %v. Using defaults.", err)
+		}
 	}
 
 	file, err := embeddedFiles.ReadFile("models.json")
@@ -117,7 +139,10 @@ func init() {
 		targetModels = []string{"gpt-4", "claude-3", "llama-3"}
 		return
 	}
-	json.Unmarshal(file, &targetModels)
+	if err := json.Unmarshal(file, &targetModels); err != nil {
+		log.Printf("Error parsing models.json: %v. Using defaults.", err)
+		targetModels = []string{"gpt-4", "claude-3", "llama-3"}
+	}
 
 	licFile, err := embeddedFiles.ReadFile("licenses.json")
 	if err != nil {
@@ -131,7 +156,9 @@ func init() {
 			"gemini":   {License: "Proprietary (Google)"},
 		}
 	} else {
-		json.Unmarshal(licFile, &modelLicenseMap)
+		if err := json.Unmarshal(licFile, &modelLicenseMap); err != nil {
+			log.Printf("Error parsing licenses.json: %v. Using defaults.", err)
+		}
 	}
 }
 
@@ -158,8 +185,6 @@ func main() {
 
 		// Phase 7: Sync to SaaS if Pro API Key is present
 		apiKey := os.Getenv("AICAP_API_KEY")
-
-		fmt.Printf("\n[DEBUG] Length of AICAP_API_KEY environment variable: %d\n", len(apiKey))
 
 		if apiKey != "" {
 			fmt.Println("\n[+] Pro API Key detected. Syncing AI-BOM and Proof Drill to AIcap Cloud...")
@@ -297,9 +322,12 @@ func main() {
 		json.NewDecoder(r.Body).Decode(&bom)
 		bomJSON, _ := json.Marshal(bom)
 
-		// 1. Insert the Project
+		// 1. Upsert the Project (avoid creating duplicates)
 		var projectID string
-		err := db.QueryRow("INSERT INTO projects (name) VALUES ($1) RETURNING id", bom.ProjectName).Scan(&projectID)
+		err := db.QueryRow(`
+			INSERT INTO projects (name) VALUES ($1)
+			ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
+			RETURNING id`, bom.ProjectName).Scan(&projectID)
 		if err != nil {
 			http.Error(w, "Database error: "+err.Error(), http.StatusInternalServerError)
 			return
@@ -514,6 +542,61 @@ func main() {
 		w.WriteHeader(http.StatusOK)
 	})
 
+	// Secure server-side API key generation endpoint
+	http.HandleFunc("/api/generate-key", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+
+		if r.Method == "OPTIONS" {
+			return
+		}
+
+		if r.Method != "POST" {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		if !isCloudSaaS || db == nil {
+			http.Error(w, "SaaS features require cloud deployment", http.StatusInternalServerError)
+			return
+		}
+
+		var reqBody struct {
+			UserID string `json:"userID"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&reqBody); err != nil || reqBody.UserID == "" {
+			http.Error(w, "Invalid request: userID required", http.StatusBadRequest)
+			return
+		}
+
+		// Check if user already has a key
+		var existingKey string
+		err := db.QueryRow("SELECT token FROM api_keys WHERE user_id = $1", reqBody.UserID).Scan(&existingKey)
+		if err == nil {
+			// Key already exists, return it
+			json.NewEncoder(w).Encode(map[string]string{"apiKey": existingKey})
+			return
+		}
+
+		// Generate a cryptographically secure API key
+		keyBytes := make([]byte, 24)
+		if _, err := rand.Read(keyBytes); err != nil {
+			http.Error(w, "Failed to generate key", http.StatusInternalServerError)
+			return
+		}
+		apiKey := "aicap_pro_sk_" + hex.EncodeToString(keyBytes)
+
+		_, err = db.Exec("INSERT INTO api_keys (user_id, token) VALUES ($1, $2)", reqBody.UserID, apiKey)
+		if err != nil {
+			http.Error(w, "Failed to store key: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		w.WriteHeader(http.StatusCreated)
+		json.NewEncoder(w).Encode(map[string]string{"apiKey": apiKey})
+	})
+
 	log.Fatal(http.ListenAndServe(":"+port, nil))
 }
 
@@ -605,6 +688,18 @@ func performScan(scanDir string) AIBOM {
 				deps := parsePackageJson(path)
 				bom.Dependencies = append(bom.Dependencies, deps...)
 			}
+			if info.Name() == "go.mod" {
+				deps := parseGoMod(path)
+				bom.Dependencies = append(bom.Dependencies, deps...)
+			}
+			if info.Name() == "pyproject.toml" {
+				deps := parsePyProjectToml(path)
+				bom.Dependencies = append(bom.Dependencies, deps...)
+			}
+			if info.Name() == "Dockerfile" || strings.HasPrefix(info.Name(), "Dockerfile.") {
+				deps := parseDockerfile(path)
+				bom.Dependencies = append(bom.Dependencies, deps...)
+			}
 			if strings.HasSuffix(info.Name(), ".go") {
 				deps := parseGoAST(path)
 				bom.Dependencies = append(bom.Dependencies, deps...)
@@ -679,7 +774,163 @@ func performScan(scanDir string) AIBOM {
 		}
 	}
 
+	// Phase: Policy-as-Code Evaluation
+	// Load .aicap.yml policy if it exists in the scanned directory
+	policy := loadPolicyConfig(scanDir)
+	if policy != nil {
+		bom.PolicyViolations = evaluatePolicy(policy, bom)
+		if len(bom.PolicyViolations) > 0 {
+			for _, v := range bom.PolicyViolations {
+				if v.Severity == "Blocker" {
+					bom.Compliance = "Blocked by Policy"
+					break
+				}
+			}
+		}
+	}
+
 	return bom
+}
+
+// loadPolicyConfig reads a .aicap.yml policy configuration file
+func loadPolicyConfig(scanDir string) *PolicyConfig {
+	policyPath := filepath.Join(scanDir, ".aicap.yml")
+	data, err := os.ReadFile(policyPath)
+	if err != nil {
+		return nil // No policy file — that's okay
+	}
+
+	policy := &PolicyConfig{}
+
+	// Simple YAML-like parser for our specific format (avoids yaml dependency)
+	lines := strings.Split(string(data), "\n")
+	var currentList *[]string
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+
+		// Skip comments and empty lines
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+
+		// Handle list items
+		if strings.HasPrefix(trimmed, "- ") && currentList != nil {
+			item := strings.TrimSpace(strings.TrimPrefix(trimmed, "- "))
+			item = strings.Trim(item, "\"'")
+			*currentList = append(*currentList, item)
+			continue
+		}
+
+		// Handle key-value pairs
+		if strings.Contains(trimmed, ":") {
+			parts := strings.SplitN(trimmed, ":", 2)
+			key := strings.TrimSpace(parts[0])
+			val := strings.TrimSpace(parts[1])
+			val = strings.Trim(val, "\"'")
+			currentList = nil
+
+			switch key {
+			case "allowed_models":
+				currentList = &policy.AllowedModels
+			case "blocked_models":
+				currentList = &policy.BlockedModels
+			case "allowed_licenses":
+				currentList = &policy.AllowedLicenses
+			case "max_risk_level":
+				policy.MaxRiskLevel = val
+			case "block_on_high_risk":
+				policy.BlockOnHighRisk = val == "true"
+			case "require_licenses":
+				policy.RequireLicenses = val == "true"
+			}
+		}
+	}
+
+	return policy
+}
+
+// evaluatePolicy checks detected dependencies against the policy configuration
+func evaluatePolicy(policy *PolicyConfig, bom AIBOM) []PolicyViolation {
+	var violations []PolicyViolation
+
+	for _, dep := range bom.Dependencies {
+		depNameLower := strings.ToLower(dep.Name)
+		depVersionLower := strings.ToLower(dep.Version)
+
+		// Check blocked models
+		for _, blocked := range policy.BlockedModels {
+			blockedLower := strings.ToLower(blocked)
+			if strings.Contains(depNameLower, blockedLower) || strings.Contains(depVersionLower, blockedLower) {
+				violations = append(violations, PolicyViolation{
+					Rule:        "blocked_model",
+					Severity:    "Blocker",
+					Description: fmt.Sprintf("Model '%s' is explicitly blocked by .aicap.yml policy", dep.Version),
+					Location:    dep.Location,
+				})
+			}
+		}
+
+		// Check allowed models (if allowlist is specified, anything not in it is blocked)
+		if len(policy.AllowedModels) > 0 && (dep.Name == "Hardcoded Model" || strings.HasPrefix(dep.Ecosystem, "Model Weight")) {
+			isAllowed := false
+			for _, allowed := range policy.AllowedModels {
+				allowedLower := strings.ToLower(allowed)
+				if strings.Contains(depVersionLower, allowedLower) || strings.Contains(depNameLower, allowedLower) {
+					isAllowed = true
+					break
+				}
+			}
+			if !isAllowed {
+				violations = append(violations, PolicyViolation{
+					Rule:        "allowed_model_violation",
+					Severity:    "Blocker",
+					Description: fmt.Sprintf("Model '%s' is not in the approved model allowlist defined in .aicap.yml", dep.Version),
+					Location:    dep.Location,
+				})
+			}
+		}
+
+		// Check risk level threshold
+		if policy.BlockOnHighRisk && dep.RiskLevel == "High" {
+			violations = append(violations, PolicyViolation{
+				Rule:        "high_risk_blocked",
+				Severity:    "Blocker",
+				Description: fmt.Sprintf("High-risk dependency '%s' blocked by policy (block_on_high_risk: true)", dep.Name),
+				Location:    dep.Location,
+			})
+		}
+
+		// Check license requirements
+		if policy.RequireLicenses && dep.License == "" && dep.RiskLevel == "High" {
+			violations = append(violations, PolicyViolation{
+				Rule:        "missing_license",
+				Severity:    "Warning",
+				Description: fmt.Sprintf("High-risk dependency '%s' has no license information. Policy requires licenses for all high-risk components.", dep.Name),
+				Location:    dep.Location,
+			})
+		}
+
+		// Check allowed licenses
+		if len(policy.AllowedLicenses) > 0 && dep.License != "" {
+			isAllowed := false
+			for _, allowedLic := range policy.AllowedLicenses {
+				if strings.EqualFold(dep.License, allowedLic) {
+					isAllowed = true
+					break
+				}
+			}
+			if !isAllowed {
+				violations = append(violations, PolicyViolation{
+					Rule:        "license_not_allowed",
+					Severity:    "Warning",
+					Description: fmt.Sprintf("License '%s' for '%s' is not in the approved license list", dep.License, dep.Name),
+					Location:    dep.Location,
+				})
+			}
+		}
+	}
+
+	return violations
 }
 
 // parseRequirementsTxt parses Python dependencies
@@ -948,5 +1199,240 @@ func parseGoAST(filePath string) []AIDependency {
 		return true
 	})
 
+	return found
+}
+
+// parseGoMod extracts AI dependencies from Go module files
+func parseGoMod(filePath string) []AIDependency {
+	var found []AIDependency
+	file, err := os.Open(filePath)
+	if err != nil {
+		return found
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	inRequireBlock := false
+	// Match lines like: github.com/sashabaranov/go-openai v1.20.0
+	requireLineRe := regexp.MustCompile(`^\s*([^\s]+)\s+v?([^\s]+)`)
+
+	// Known AI-related Go packages mapped to our library metadata
+	goAIModules := map[string]string{
+		"go-openai":          "openai",
+		"anthropic-sdk-go":   "anthropic",
+		"generative-ai-go":  "google-generativeai",
+		"langchaingo":       "langchain",
+		"ollama":            "ollama",
+		"go-cohere":         "cohere",
+	}
+
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+
+		if line == "require (" {
+			inRequireBlock = true
+			continue
+		}
+		if line == ")" && inRequireBlock {
+			inRequireBlock = false
+			continue
+		}
+
+		// Handle single-line require: require github.com/foo/bar v1.0.0
+		if strings.HasPrefix(line, "require ") && !strings.Contains(line, "(") {
+			line = strings.TrimPrefix(line, "require ")
+			inRequireBlock = false // it's a one-liner
+		} else if !inRequireBlock {
+			continue
+		}
+
+		matches := requireLineRe.FindStringSubmatch(line)
+		if len(matches) < 3 {
+			continue
+		}
+
+		modulePath := strings.ToLower(matches[1])
+		version := matches[2]
+
+		// Check if any known AI Go module name appears in the module path
+		for goModKey, libKey := range goAIModules {
+			if strings.Contains(modulePath, goModKey) {
+				meta, exists := targetAILibraries[libKey]
+				if !exists {
+					meta = LibraryMeta{Risk: "Medium", Desc: "AI-related Go module"}
+				}
+				found = append(found, AIDependency{
+					Name:        modulePath,
+					Version:     version,
+					Ecosystem:   "Go (module)",
+					RiskLevel:   meta.Risk,
+					Description: meta.Desc,
+					Location:    filePath,
+				})
+				break
+			}
+		}
+	}
+	return found
+}
+
+// parsePyProjectToml extracts AI dependencies from Poetry pyproject.toml files
+func parsePyProjectToml(filePath string) []AIDependency {
+	var found []AIDependency
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		return found
+	}
+
+	content := string(data)
+	lines := strings.Split(content, "\n")
+	inDepsSection := false
+
+	// Match lines like: openai = "^1.12.0" or torch = {version = ">=2.0"}
+	depLineRe := regexp.MustCompile(`^\s*([a-zA-Z0-9_-]+)\s*=\s*(.+)`)
+
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+
+		// Detect dependency sections
+		if trimmed == "[tool.poetry.dependencies]" || trimmed == "[project.dependencies]" {
+			inDepsSection = true
+			continue
+		}
+
+		// Exit when we hit a new section
+		if strings.HasPrefix(trimmed, "[") {
+			inDepsSection = false
+			continue
+		}
+
+		if !inDepsSection {
+			continue
+		}
+
+		matches := depLineRe.FindStringSubmatch(trimmed)
+		if len(matches) < 3 {
+			continue
+		}
+
+		pkgName := strings.ToLower(matches[1])
+		versionSpec := matches[2]
+
+		// Skip non-dependency keys like "python"
+		if pkgName == "python" {
+			continue
+		}
+
+		// Extract version string — handles "^1.0", {version = ">=2.0"}, etc.
+		version := "unknown"
+		versionSpec = strings.Trim(versionSpec, " \"'")
+		if strings.HasPrefix(versionSpec, "{") {
+			// Complex version specifier: extract version value
+			vRe := regexp.MustCompile(`version\s*=\s*"([^"]+)"`)
+			vMatch := vRe.FindStringSubmatch(versionSpec)
+			if len(vMatch) > 1 {
+				version = vMatch[1]
+			}
+		} else {
+			version = strings.TrimLeft(versionSpec, "^~>=<!")
+		}
+
+		if meta, exists := targetAILibraries[pkgName]; exists {
+			found = append(found, AIDependency{
+				Name:        pkgName,
+				Version:     version,
+				Ecosystem:   "Python (Poetry/PEP)",
+				RiskLevel:   meta.Risk,
+				Description: meta.Desc,
+				Location:    filePath,
+			})
+		}
+	}
+	return found
+}
+
+// parseDockerfile analyzes Dockerfiles to detect AI framework base images and model weight copies
+func parseDockerfile(filePath string) []AIDependency {
+	var found []AIDependency
+	file, err := os.Open(filePath)
+	if err != nil {
+		return found
+	}
+	defer file.Close()
+
+	// Known AI-related Docker base images
+	aiBaseImages := map[string]string{
+		"pytorch":       "PyTorch Container Image",
+		"tensorflow":    "TensorFlow Container Image",
+		"nvidia/cuda":   "NVIDIA CUDA Base Image",
+		"huggingface":   "Hugging Face Container Image",
+		"nvcr.io":       "NVIDIA Container Registry Image",
+		"ollama":        "Ollama Container Image",
+		"vllm":          "vLLM Inference Engine Image",
+		"tritonserver":  "NVIDIA Triton Inference Server",
+	}
+
+	scanner := bufio.NewScanner(file)
+	lineNum := 0
+	for scanner.Scan() {
+		lineNum++
+		line := strings.TrimSpace(scanner.Text())
+		lineLower := strings.ToLower(line)
+
+		// Detect FROM instructions with AI base images
+		if strings.HasPrefix(lineLower, "from ") {
+			imageParts := strings.Fields(line)
+			if len(imageParts) >= 2 {
+				imageName := strings.ToLower(imageParts[1])
+				for aiKey, aiDesc := range aiBaseImages {
+					if strings.Contains(imageName, aiKey) {
+						found = append(found, AIDependency{
+							Name:        imageParts[1],
+							Version:     "docker-image",
+							Ecosystem:   "Container Image (Dockerfile)",
+							RiskLevel:   "High",
+							Description: aiDesc + " detected as base image",
+							Location:    fmt.Sprintf("%s:%d", filePath, lineNum),
+						})
+						break
+					}
+				}
+			}
+		}
+
+		// Detect COPY/ADD of model weight files
+		if strings.HasPrefix(lineLower, "copy ") || strings.HasPrefix(lineLower, "add ") {
+			modelExtensions := []string{".safetensors", ".onnx", ".pt", ".h5", ".gguf", ".bin", ".tflite", ".pb", ".ckpt"}
+			for _, ext := range modelExtensions {
+				if strings.Contains(lineLower, ext) {
+					found = append(found, AIDependency{
+						Name:        "Containerized Model Weight",
+						Version:     "docker-layer",
+						Ecosystem:   "Container Image (Dockerfile)",
+						RiskLevel:   "High",
+						Description: fmt.Sprintf("Model weight file (%s) being copied into container image", ext),
+						Location:    fmt.Sprintf("%s:%d", filePath, lineNum),
+					})
+					break
+				}
+			}
+		}
+
+		// Detect pip install of AI libraries within Dockerfile RUN commands
+		if strings.HasPrefix(lineLower, "run ") && strings.Contains(lineLower, "pip install") {
+			for libName, meta := range targetAILibraries {
+				if strings.Contains(lineLower, libName) {
+					found = append(found, AIDependency{
+						Name:        libName,
+						Version:     "docker-install",
+						Ecosystem:   "Container Image (pip in Dockerfile)",
+						RiskLevel:   meta.Risk,
+						Description: meta.Desc + " (installed in Dockerfile)",
+						Location:    fmt.Sprintf("%s:%d", filePath, lineNum),
+					})
+				}
+			}
+		}
+	}
 	return found
 }
