@@ -203,7 +203,12 @@ func main() {
 
 		if apiKey != "" {
 			fmt.Println("\n[+] Pro API Key detected. Syncing AI-BOM and Proof Drill to AIcap Cloud...")
-			req, err := http.NewRequest("POST", "https://aicap-staging.onrender.com/api/save-proof", bytes.NewBuffer(bomJSON))
+			apiURL := os.Getenv("AICAP_API_URL")
+			if apiURL == "" {
+				// Default to production. The CLI running in a workflow should always have this set.
+				apiURL = "https://aicap.onrender.com/api/save-proof"
+			}
+			req, err := http.NewRequest("POST", apiURL, bytes.NewBuffer(bomJSON))
 			if err == nil {
 				req.Header.Set("Content-Type", "application/json")
 				req.Header.Set("Authorization", "Bearer "+apiKey)
