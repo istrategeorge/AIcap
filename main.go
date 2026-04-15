@@ -68,12 +68,12 @@ type PolicyViolation struct {
 
 // PolicyConfig represents the .aicap.yml policy-as-code configuration
 type PolicyConfig struct {
-	AllowedModels    []string `json:"allowedModels"`
-	BlockedModels    []string `json:"blockedModels"`
-	MaxRiskLevel     string   `json:"maxRiskLevel"`
-	BlockOnHighRisk  bool     `json:"blockOnHighRisk"`
-	RequireLicenses  bool     `json:"requireLicenses"`
-	AllowedLicenses  []string `json:"allowedLicenses"`
+	AllowedModels   []string `json:"allowedModels"`
+	BlockedModels   []string `json:"blockedModels"`
+	MaxRiskLevel    string   `json:"maxRiskLevel"`
+	BlockOnHighRisk bool     `json:"blockOnHighRisk"`
+	RequireLicenses bool     `json:"requireLicenses"`
+	AllowedLicenses []string `json:"allowedLicenses"`
 }
 
 // Map of known AI libraries and their assumed regulatory risk (MVP level)
@@ -203,7 +203,7 @@ func main() {
 
 		if apiKey != "" {
 			fmt.Println("\n[+] Pro API Key detected. Syncing AI-BOM and Proof Drill to AIcap Cloud...")
-			req, err := http.NewRequest("POST", "https://aicap.onrender.com/api/save-proof", bytes.NewBuffer(bomJSON))
+			req, err := http.NewRequest("POST", "https://aicap-staging.onrender.com/api/save-proof", bytes.NewBuffer(bomJSON))
 			if err == nil {
 				req.Header.Set("Content-Type", "application/json")
 				req.Header.Set("Authorization", "Bearer "+apiKey)
@@ -317,7 +317,7 @@ func main() {
 			return
 		}
 
-		// Phase 7: API Key Authentication for Cloud SaaS
+		// Phase 7: API Key Authentication for Cloud SaaS & Rate Limiting
 		if isCloudSaaS {
 			authHeader := r.Header.Get("Authorization")
 			if authHeader == "" || !strings.HasPrefix(authHeader, "Bearer ") {
@@ -325,11 +325,26 @@ func main() {
 				return
 			}
 			apiKey := strings.TrimPrefix(authHeader, "Bearer ")
-			var userID string
-			err := db.QueryRow("SELECT user_id FROM api_keys WHERE token = $1", apiKey).Scan(&userID)
+
+			var userID, subTier string
+			var scansUsed int
+			// Using COALESCE for backward compatibility before migration
+			err := db.QueryRow("SELECT user_id, COALESCE(subscription_tier, 'free'), COALESCE(scans_this_month, 0) FROM api_keys WHERE token = $1", apiKey).Scan(&userID, &subTier, &scansUsed)
 			if err != nil {
 				http.Error(w, "Unauthorized: Invalid API Key", http.StatusUnauthorized)
 				return
+			}
+
+			// Apply Rate Limiting based on Tier
+			if subTier == "free" && scansUsed >= 10 {
+				http.Error(w, "Payment Required: Free tier limit of 10 cloud syncs reached. Please upgrade to Pro.", http.StatusPaymentRequired)
+				return
+			}
+
+			// Increment usage tracking
+			_, err = db.Exec("UPDATE api_keys SET scans_this_month = scans_this_month + 1 WHERE token = $1", apiKey)
+			if err != nil {
+				log.Printf("Failed to increment usage tracking for API Key: %v", err)
 			}
 		}
 
@@ -560,17 +575,21 @@ func main() {
 					if _, keyErr := rand.Read(keyBytes); keyErr == nil {
 						apiKey := "aicap_pro_sk_" + hex.EncodeToString(keyBytes)
 						_, insertErr := db.Exec(
-							"INSERT INTO api_keys (user_id, token, stripe_customer_id) VALUES ($1, $2, $3)",
+							"INSERT INTO api_keys (user_id, token, stripe_customer_id, subscription_tier) VALUES ($1, $2, $3, 'pro')",
 							userID, apiKey, checkoutSession.Customer.ID,
 						)
 						if insertErr != nil {
 							log.Printf("Failed to provision API key for user %s: %v", userID, insertErr)
 						} else {
-							log.Printf("API key provisioned for user %s", userID)
+							log.Printf("API key provisioned (Pro Tier) for user %s", userID)
 						}
 					}
 				} else {
-					log.Printf("User %s already has an API key, skipping provisioning", userID)
+					log.Printf("User %s already has an API key, upgrading to Pro", userID)
+					_, updateErr := db.Exec("UPDATE api_keys SET subscription_tier = 'pro', stripe_customer_id = $1 WHERE user_id = $2", checkoutSession.Customer.ID, userID)
+					if updateErr != nil {
+						log.Printf("Failed to upgrade API key to Pro for user %s: %v", userID, updateErr)
+					}
 				}
 			}
 
@@ -845,17 +864,17 @@ func generateAnnexIVMarkdown(bom AIBOM) string {
 
 // CycloneDX SBOM structures — minimal CycloneDX 1.5 compatible output
 type CycloneDXBOM struct {
-	BOMFormat    string              `json:"bomFormat"`
-	SpecVersion  string              `json:"specVersion"`
-	SerialNumber string              `json:"serialNumber"`
-	Version      int                 `json:"version"`
-	Metadata     CycloneDXMetadata   `json:"metadata"`
+	BOMFormat    string               `json:"bomFormat"`
+	SpecVersion  string               `json:"specVersion"`
+	SerialNumber string               `json:"serialNumber"`
+	Version      int                  `json:"version"`
+	Metadata     CycloneDXMetadata    `json:"metadata"`
 	Components   []CycloneDXComponent `json:"components"`
 }
 
 type CycloneDXMetadata struct {
-	Timestamp string              `json:"timestamp"`
-	Component CycloneDXComponent  `json:"component"`
+	Timestamp string             `json:"timestamp"`
+	Component CycloneDXComponent `json:"component"`
 }
 
 type CycloneDXComponent struct {
@@ -1488,12 +1507,12 @@ func parseGoMod(filePath string) []AIDependency {
 
 	// Known AI-related Go packages mapped to our library metadata
 	goAIModules := map[string]string{
-		"go-openai":          "openai",
-		"anthropic-sdk-go":   "anthropic",
-		"generative-ai-go":  "google-generativeai",
-		"langchaingo":       "langchain",
-		"ollama":            "ollama",
-		"go-cohere":         "cohere",
+		"go-openai":        "openai",
+		"anthropic-sdk-go": "anthropic",
+		"generative-ai-go": "google-generativeai",
+		"langchaingo":      "langchain",
+		"ollama":           "ollama",
+		"go-cohere":        "cohere",
 	}
 
 	for scanner.Scan() {
@@ -1632,14 +1651,14 @@ func parseDockerfile(filePath string) []AIDependency {
 
 	// Known AI-related Docker base images
 	aiBaseImages := map[string]string{
-		"pytorch":       "PyTorch Container Image",
-		"tensorflow":    "TensorFlow Container Image",
-		"nvidia/cuda":   "NVIDIA CUDA Base Image",
-		"huggingface":   "Hugging Face Container Image",
-		"nvcr.io":       "NVIDIA Container Registry Image",
-		"ollama":        "Ollama Container Image",
-		"vllm":          "vLLM Inference Engine Image",
-		"tritonserver":  "NVIDIA Triton Inference Server",
+		"pytorch":      "PyTorch Container Image",
+		"tensorflow":   "TensorFlow Container Image",
+		"nvidia/cuda":  "NVIDIA CUDA Base Image",
+		"huggingface":  "Hugging Face Container Image",
+		"nvcr.io":      "NVIDIA Container Registry Image",
+		"ollama":       "Ollama Container Image",
+		"vllm":         "vLLM Inference Engine Image",
+		"tritonserver": "NVIDIA Triton Inference Server",
 	}
 
 	scanner := bufio.NewScanner(file)
@@ -1795,32 +1814,32 @@ func parseTerraformFile(filePath string) []FinOpsFinding {
 
 	// AWS GPU instance families
 	awsGPUInstances := map[string]string{
-		"p3.":    "NVIDIA V100 GPU (p3) — $3.06-$24.48/hr",
-		"p4d.":   "NVIDIA A100 GPU (p4d) — $32.77/hr",
-		"p4de.":  "NVIDIA A100 80GB GPU (p4de) — $40.97/hr",
-		"p5.":    "NVIDIA H100 GPU (p5) — $98.32/hr",
-		"g4dn.":  "NVIDIA T4 GPU (g4dn) — $0.53-$7.82/hr",
-		"g5.":    "NVIDIA A10G GPU (g5) — $1.01-$16.29/hr",
-		"g5g.":   "AWS Graviton GPU (g5g) — $0.42-$2.74/hr",
-		"g6.":    "NVIDIA L4 GPU (g6) — $0.80-$13.35/hr",
-		"inf1.":  "AWS Inferentia (inf1) — $0.23-$4.72/hr",
-		"inf2.":  "AWS Inferentia2 (inf2) — $0.76-$12.98/hr",
-		"trn1.":  "AWS Trainium (trn1) — $1.34-$21.50/hr",
+		"p3.":   "NVIDIA V100 GPU (p3) — $3.06-$24.48/hr",
+		"p4d.":  "NVIDIA A100 GPU (p4d) — $32.77/hr",
+		"p4de.": "NVIDIA A100 80GB GPU (p4de) — $40.97/hr",
+		"p5.":   "NVIDIA H100 GPU (p5) — $98.32/hr",
+		"g4dn.": "NVIDIA T4 GPU (g4dn) — $0.53-$7.82/hr",
+		"g5.":   "NVIDIA A10G GPU (g5) — $1.01-$16.29/hr",
+		"g5g.":  "AWS Graviton GPU (g5g) — $0.42-$2.74/hr",
+		"g6.":   "NVIDIA L4 GPU (g6) — $0.80-$13.35/hr",
+		"inf1.": "AWS Inferentia (inf1) — $0.23-$4.72/hr",
+		"inf2.": "AWS Inferentia2 (inf2) — $0.76-$12.98/hr",
+		"trn1.": "AWS Trainium (trn1) — $1.34-$21.50/hr",
 	}
 
 	// Azure GPU instance families
 	azureGPUInstances := map[string]string{
-		"standard_nc":  "NVIDIA T4/V100 GPU (NC-series)",
-		"standard_nd":  "NVIDIA A100/H100 GPU (ND-series)",
-		"standard_nv":  "NVIDIA GPU for visualization (NV-series)",
+		"standard_nc": "NVIDIA T4/V100 GPU (NC-series)",
+		"standard_nd": "NVIDIA A100/H100 GPU (ND-series)",
+		"standard_nv": "NVIDIA GPU for visualization (NV-series)",
 	}
 
 	// GCP GPU instance families
 	gcpGPUInstances := map[string]string{
-		"a2-highgpu":    "NVIDIA A100 GPU (a2-highgpu)",
-		"a2-megagpu":    "NVIDIA A100 80GB GPU (a2-megagpu)",
-		"g2-standard":   "NVIDIA L4 GPU (g2-standard)",
-		"a3-highgpu":    "NVIDIA H100 GPU (a3-highgpu)",
+		"a2-highgpu":  "NVIDIA A100 GPU (a2-highgpu)",
+		"a2-megagpu":  "NVIDIA A100 80GB GPU (a2-megagpu)",
+		"g2-standard": "NVIDIA L4 GPU (g2-standard)",
+		"a3-highgpu":  "NVIDIA H100 GPU (a3-highgpu)",
 	}
 
 	checkInstances := func(instances map[string]string, cloud string) {
@@ -1868,30 +1887,30 @@ func parseEnvFile(filePath string) []AIDependency {
 
 	// Sensitive key patterns for AI/ML platforms
 	sensitivePatterns := map[string]string{
-		"sk-":                     "OpenAI API Key",
-		"sk-ant-":                 "Anthropic API Key",
-		"hf_":                     "Hugging Face API Token",
-		"AIza":                    "Google AI API Key",
-		"AKIA":                    "AWS Access Key (potential SageMaker/Bedrock)",
-		"r8_":                     "Replicate API Token",
-		"xai-":                    "xAI (Grok) API Key",
+		"sk-":     "OpenAI API Key",
+		"sk-ant-": "Anthropic API Key",
+		"hf_":     "Hugging Face API Token",
+		"AIza":    "Google AI API Key",
+		"AKIA":    "AWS Access Key (potential SageMaker/Bedrock)",
+		"r8_":     "Replicate API Token",
+		"xai-":    "xAI (Grok) API Key",
 	}
 
 	// Also check key names that hint at AI services
 	sensitiveKeyNames := map[string]string{
-		"OPENAI_API_KEY":          "OpenAI",
-		"ANTHROPIC_API_KEY":       "Anthropic",
-		"HUGGINGFACE_TOKEN":       "Hugging Face",
-		"HF_TOKEN":                "Hugging Face",
-		"GOOGLE_AI_API_KEY":       "Google AI",
-		"COHERE_API_KEY":          "Cohere",
-		"REPLICATE_API_TOKEN":     "Replicate",
-		"AZURE_OPENAI_API_KEY":    "Azure OpenAI",
-		"AWS_SECRET_ACCESS_KEY":   "AWS (SageMaker/Bedrock)",
-		"WANDB_API_KEY":           "Weights & Biases",
-		"LANGCHAIN_API_KEY":       "LangChain/LangSmith",
-		"PINECONE_API_KEY":        "Pinecone Vector DB",
-		"TOGETHER_API_KEY":        "Together AI",
+		"OPENAI_API_KEY":        "OpenAI",
+		"ANTHROPIC_API_KEY":     "Anthropic",
+		"HUGGINGFACE_TOKEN":     "Hugging Face",
+		"HF_TOKEN":              "Hugging Face",
+		"GOOGLE_AI_API_KEY":     "Google AI",
+		"COHERE_API_KEY":        "Cohere",
+		"REPLICATE_API_TOKEN":   "Replicate",
+		"AZURE_OPENAI_API_KEY":  "Azure OpenAI",
+		"AWS_SECRET_ACCESS_KEY": "AWS (SageMaker/Bedrock)",
+		"WANDB_API_KEY":         "Weights & Biases",
+		"LANGCHAIN_API_KEY":     "LangChain/LangSmith",
+		"PINECONE_API_KEY":      "Pinecone Vector DB",
+		"TOGETHER_API_KEY":      "Together AI",
 	}
 
 	scanner := bufio.NewScanner(file)

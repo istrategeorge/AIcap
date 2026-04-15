@@ -1,0 +1,20 @@
+# AIcap EU AI Act Compliance Scanner - GitLab CI Template
+# Usage: include this template in your .gitlab-ci.yml
+# Make sure to set AICAP_API_KEY in your GitLab CI/CD Variables
+
+aicap_compliance_scan:
+  stage: test
+  image: golang:1.22
+  script:
+    - echo "Downloading AIcap scanner..."
+    - git clone https://github.com/istrategeorge/AIcap.git /tmp/aicap
+    - cd /tmp/aicap
+    - go build -o aicap .
+    - echo "Running AIcap Compliance Scan on $CI_PROJECT_DIR"
+    # Run the scanner against the project directory
+    # AICAP_API_KEY should be set in GitLab CI/CD Variables (masked)
+    - ./aicap --cli $CI_PROJECT_DIR
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  allow_failure: false # Will fail the pipeline if Blockers are found

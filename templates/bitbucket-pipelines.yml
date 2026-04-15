@@ -1,0 +1,30 @@
+# AIcap EU AI Act Compliance Scanner - Bitbucket Pipelines Template
+# Make sure to set AICAP_API_KEY in your Bitbucket Repository Variables (secured)
+
+image: golang:1.22
+
+pipelines:
+  default:
+    - step:
+        name: Build and Test
+        script:
+          - echo "Building project..."
+    - step:
+        name: AIcap Compliance Scan
+        script:
+          - echo "Downloading AIcap scanner..."
+          - git clone https://github.com/istrategeorge/AIcap.git /tmp/aicap
+          - cd /tmp/aicap
+          - go build -o aicap .
+          - echo "Running AIcap Compliance Scan on $BITBUCKET_CLONE_DIR"
+          # Run the scanner against the clone directory
+          - ./aicap --cli $BITBUCKET_CLONE_DIR
+  pull-requests:
+    '**':
+      - step:
+          name: AIcap Compliance Scan
+          script:
+            - git clone https://github.com/istrategeorge/AIcap.git /tmp/aicap
+            - cd /tmp/aicap
+            - go build -o aicap .
+            - ./aicap --cli $BITBUCKET_CLONE_DIR
