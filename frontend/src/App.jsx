@@ -80,12 +80,17 @@ export default function App() {
     }
   };
 
-  // Fetch and set user session + API Key
-  const fetchAndSetUserSession = async (user) => {
+  // Fetch and set user session + API Key.
+  // `supabaseSession` is the object returned by supabase.auth (contains
+  // access_token). The backend uses that JWT to authenticate /api/generate-key
+  // — it derives userID from the token's `sub` claim, so the body is ignored.
+  const fetchAndSetUserSession = async (supabaseSession) => {
+    const user = supabaseSession.user;
+    const accessToken = supabaseSession.access_token;
     try {
       let { data: keys } = await supabase.from('api_keys').select('token').eq('user_id', user.id);
       let apiKey = keys && keys.length > 0 ? keys[0].token : "";
-      
+
       const urlParams = new URLSearchParams(window.location.search);
       const sessionId = urlParams.get('session_id');
 
@@ -94,8 +99,10 @@ export default function App() {
         try {
           const response = await fetch(`${API_BASE_URL}/api/generate-key`, {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ userID: user.id })
+            headers: {
+              "Content-Type": "application/json",
+              "Authorization": `Bearer ${accessToken}`,
+            },
           });
           if (response.ok) {
             const data = await response.json();
@@ -107,7 +114,7 @@ export default function App() {
         window.history.replaceState({}, document.title, "/"); // Clean up the URL
       }
 
-      setSession({ user, apiKey });
+      setSession({ user, apiKey, accessToken });
       if (apiKey) fetchHistoryData(apiKey);
     } catch (error) {
       console.error("Failed to load user API key:", error);
@@ -118,21 +125,21 @@ export default function App() {
   useEffect(() => {
     if (!IS_CLOUD_SAAS) {
       fetchScanData();
+      fetchDbStatus();
     }
-    fetchDbStatus();
 
     if (IS_CLOUD_SAAS) {
       // Check active session and fetch API key on page load
       supabase.auth.getSession().then(({ data: { session } }) => {
         if (session && session.user) {
-          fetchAndSetUserSession(session.user);
+          fetchAndSetUserSession(session);
         }
       });
 
       // Listen for auth changes (e.g., logging in, or logging out from another tab)
       const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
         if (session && session.user) {
-          fetchAndSetUserSession(session.user);
+          fetchAndSetUserSession(session);
         } else {
           setSession(null);
         }
@@ -225,10 +232,14 @@ export default function App() {
   const handleCheckout = async () => {
     setIsCheckoutLoading(true);
     try {
+      // The backend derives userID + email from the verified Supabase JWT,
+      // so there is no need to (and no point in) supplying them in the body.
       const response = await fetch(`${API_BASE_URL}/api/create-checkout-session`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ userEmail: session.user.email, userID: session.user.id })
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${session.accessToken}`,
+        },
       });
 
       if (!response.ok) {
