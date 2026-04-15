@@ -50,9 +50,13 @@ export default function App() {
   };
 
   // Fetch historical proof drills
-  const fetchHistoryData = async () => {
+  const fetchHistoryData = async (keyOverride = "") => {
     try {
-      const response = await fetch(`${API_BASE_URL}/api/history`);
+      const token = keyOverride || (session ? session.apiKey : "");
+      const headers = {};
+      if (token) headers["Authorization"] = `Bearer ${token}`;
+
+      const response = await fetch(`${API_BASE_URL}/api/history`, { headers });
       if (!response.ok) return;
       const data = await response.json();
       setHistoryData(data || []);
@@ -104,7 +108,7 @@ export default function App() {
       }
 
       setSession({ user, apiKey });
-      if (apiKey) fetchHistoryData();
+      if (apiKey) fetchHistoryData(apiKey);
     } catch (error) {
       console.error("Failed to load user API key:", error);
     }
@@ -140,7 +144,10 @@ export default function App() {
 
   const fetchHistoricalProof = async (hash) => {
     try {
-      const response = await fetch(`${API_BASE_URL}/api/proof?hash=${hash}`);
+      const headers = {};
+      if (session && session.apiKey) headers["Authorization"] = `Bearer ${session.apiKey}`;
+
+      const response = await fetch(`${API_BASE_URL}/api/proof?hash=${hash}`, { headers });
       if (response.ok) {
         const data = await response.json();
         setHistoricalProof({ hash, markdown: data.markdown });
@@ -156,17 +163,20 @@ export default function App() {
     
     try {
       if (dbConfig.connected) {
+        const headers = { "Content-Type": "application/json" };
+        if (session && session.apiKey) headers["Authorization"] = `Bearer ${session.apiKey}`;
+
         // Send current state to the Go backend to store in Supabase
         const response = await fetch(`${API_BASE_URL}/api/save-proof`, {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: headers,
           body: JSON.stringify(scanData)
         });
         
         if (response.ok) {
           setMarkdownGenerated(true);
           setHistoricalProof(null); // Clear any currently viewed history
-          fetchHistoryData(); // Refresh history table after saving
+          fetchHistoryData(session ? session.apiKey : ""); // Refresh history table after saving
         } else {
           console.error("Failed to save proof drill");
         }
