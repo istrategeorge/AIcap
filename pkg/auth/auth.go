@@ -16,6 +16,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"log"
 	"net/http"
 	"os"
 	"strings"
@@ -79,6 +80,11 @@ func bearerToken(r *http.Request) string {
 // RequireSupabaseJWT is HTTP middleware that rejects requests lacking a valid
 // Supabase session token. On success it injects the user ID and email into the
 // request context (retrievable via UserID / UserEmail).
+//
+// Error mapping:
+//   - Missing/malformed Authorization header → 401 (client must supply credentials)
+//   - SUPABASE_JWT_SECRET not configured      → 500 (operator must set env var)
+//   - Expired or invalid token                → 401 (client must re-authenticate)
 func RequireSupabaseJWT(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		token := bearerToken(r)
@@ -88,7 +94,15 @@ func RequireSupabaseJWT(next http.HandlerFunc) http.HandlerFunc {
 		}
 		claims, err := VerifySupabaseJWT(token)
 		if err != nil {
-			http.Error(w, "Unauthorized: invalid token", http.StatusUnauthorized)
+			// Distinguish a missing server secret (operator error) from a bad
+			// token (client error) so the caller isn't misled into thinking
+			// their credentials are wrong when it's actually a config issue.
+			if os.Getenv("SUPABASE_JWT_SECRET") == "" {
+				log.Println("ERROR: SUPABASE_JWT_SECRET is not set — set this env var in your deployment to enable JWT auth")
+				http.Error(w, "Server configuration error: JWT secret not configured. Contact the service administrator.", http.StatusInternalServerError)
+				return
+			}
+			http.Error(w, "Unauthorized: invalid or expired token", http.StatusUnauthorized)
 			return
 		}
 		ctx := context.WithValue(r.Context(), ctxUserID, claims.Subject)

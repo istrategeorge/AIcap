@@ -117,6 +117,27 @@ func TestRequireSupabaseJWT_RejectsMissingHeader(t *testing.T) {
 	}
 }
 
+// TestRequireSupabaseJWT_MissingSecretReturns500 ensures that an unconfigured
+// SUPABASE_JWT_SECRET is surfaced as a server error (500), not a client auth
+// error (401). A 401 would mislead the caller into retrying with different
+// credentials when the real fix is an operator env-var configuration.
+func TestRequireSupabaseJWT_MissingSecretReturns500(t *testing.T) {
+	t.Setenv("SUPABASE_JWT_SECRET", "") // simulate unconfigured deployment
+	tok := "any.token.value"
+	h := RequireSupabaseJWT(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("inner handler should not run")
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/api/create-checkout-session", nil)
+	req.Header.Set("Authorization", "Bearer "+tok)
+	w := httptest.NewRecorder()
+	h(w, req)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Errorf("status = %d, want 500 (server config error)", w.Code)
+	}
+}
+
 func TestRequireSupabaseJWT_RejectsMalformedHeader(t *testing.T) {
 	t.Setenv("SUPABASE_JWT_SECRET", testSecret)
 	h := RequireSupabaseJWT(func(w http.ResponseWriter, r *http.Request) {

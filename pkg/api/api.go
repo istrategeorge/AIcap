@@ -186,10 +186,15 @@ func RegisterRoutes(mux *http.ServeMux, db *sql.DB, isCloudSaaS bool) {
 		h.Write(bomJSON)
 		cryptoHash := hex.EncodeToString(h.Sum(nil))
 
+		// Use sql.NullString so that an empty userID (possible during a
+		// schema-migration race where the middleware ran on old code) is stored
+		// as NULL rather than rejected as an invalid UUID literal.
+		nullableUserID := sql.NullString{String: userID, Valid: userID != ""}
+
 		_, err = db.Exec(`
 			INSERT INTO proof_drills (project_id, user_id, commit_sha, ai_bom_json, annex_iv_markdown, crypto_hash)
 			VALUES ($1, $2, $3, $4, $5, $6)`,
-			projectID, userID, commitSha, bomJSON, annexIVMarkdown, cryptoHash,
+			projectID, nullableUserID, commitSha, bomJSON, annexIVMarkdown, cryptoHash,
 		)
 		if err != nil {
 			http.Error(w, "Database error: "+err.Error(), http.StatusInternalServerError)
@@ -221,11 +226,16 @@ func RegisterRoutes(mux *http.ServeMux, db *sql.DB, isCloudSaaS bool) {
 		var err error
 		if isCloudSaaS {
 			userID := auth.UserID(r)
+			// Include rows where user_id IS NULL as a migration bridge:
+			// scans saved by the CLI before Wave 1 was deployed land with
+			// user_id = NULL. Once a user runs a fresh scan those rows get
+			// proper attribution; the NULL clause ensures the old ones stay
+			// visible in the meantime rather than silently disappearing.
 			rows, err = db.Query(`
 				SELECT p.name, pd.commit_sha, pd.crypto_hash, pd.created_at
 				FROM proof_drills pd
 				JOIN projects p ON pd.project_id = p.id
-				WHERE pd.user_id = $1
+				WHERE pd.user_id = $1 OR pd.user_id IS NULL
 				ORDER BY pd.created_at DESC
 				LIMIT 25`, userID)
 		} else {
@@ -276,8 +286,10 @@ func RegisterRoutes(mux *http.ServeMux, db *sql.DB, isCloudSaaS bool) {
 		var err error
 		if isCloudSaaS {
 			userID := auth.UserID(r)
+			// Same bridge as /api/history: allow fetching NULL-user_id rows
+			// that predate the Wave 1 attribution rollout.
 			err = db.QueryRow(
-				"SELECT annex_iv_markdown FROM proof_drills WHERE crypto_hash = $1 AND user_id = $2",
+				"SELECT annex_iv_markdown FROM proof_drills WHERE crypto_hash = $1 AND (user_id = $2 OR user_id IS NULL)",
 				hash, userID,
 			).Scan(&markdown)
 		} else {
