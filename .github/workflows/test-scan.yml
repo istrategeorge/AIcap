@@ -18,7 +18,9 @@ jobs:
         with:
           go-version: '1.22.x'
 
-      - name: Run AIcap Compliance Scan
-        uses: ./
-        with:
-          api-key: ${{ secrets.AICAP_API_KEY }}
+      - name: Build and Run AIcap from Source
+        env:
+          AICAP_API_KEY: ${{ secrets.AICAP_API_KEY }}
+        run: |
+          go build -o aicap .
+          ./aicap --cli .

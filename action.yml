@@ -22,7 +22,7 @@ runs:
       shell: bash
       run: |
         echo "⬇️ Downloading AIcap v1.0.0-beta statically-linked binary..."
-        curl -sL https://github.com/istrategeorge/AIcap/releases/download/1.0.0-beta/aicap-linux-amd64 -o aicap
+        curl -sL https://github.com/istrategeorge/AIcap/releases/download/v1.0.0-beta/aicap-linux-amd64 -o aicap
         chmod +x aicap
 
     - name: Execute AI-BOM Scan
