@@ -50,9 +50,13 @@ export default function App() {
   };
 
   // Fetch historical proof drills
-  const fetchHistoryData = async () => {
+  const fetchHistoryData = async (keyOverride = "") => {
     try {
-      const response = await fetch(`${API_BASE_URL}/api/history`);
+      const token = keyOverride || (session ? session.apiKey : "");
+      const headers = {};
+      if (token) headers["Authorization"] = `Bearer ${token}`;
+
+      const response = await fetch(`${API_BASE_URL}/api/history`, { headers });
       if (!response.ok) return;
       const data = await response.json();
       setHistoryData(data || []);
@@ -76,24 +80,42 @@ export default function App() {
     }
   };
 
-  // Fetch and set user session + API Key
-  const fetchAndSetUserSession = async (user) => {
+  // Fetch and set user session + API Key.
+  // `supabaseSession` is the object returned by supabase.auth (contains
+  // access_token). The backend uses that JWT to authenticate /api/generate-key
+  // — it derives userID from the token's `sub` claim, so the body is ignored.
+  const fetchAndSetUserSession = async (supabaseSession) => {
+    const user = supabaseSession.user;
+    const accessToken = supabaseSession.access_token;
     try {
       let { data: keys } = await supabase.from('api_keys').select('token').eq('user_id', user.id);
       let apiKey = keys && keys.length > 0 ? keys[0].token : "";
-      
+
       const urlParams = new URLSearchParams(window.location.search);
       const sessionId = urlParams.get('session_id');
 
-      // Auto-provision key if they just returned from a successful Stripe checkout
+      // Auto-provision key server-side if they just returned from a successful Stripe checkout
       if (!apiKey && sessionId) {
-        apiKey = "aicap_pro_sk_" + Math.random().toString(36).substring(2, 15) + "9x";
-        await supabase.from('api_keys').insert([{ user_id: user.id, token: apiKey }]);
+        try {
+          const response = await fetch(`${API_BASE_URL}/api/generate-key`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "Authorization": `Bearer ${accessToken}`,
+            },
+          });
+          if (response.ok) {
+            const data = await response.json();
+            apiKey = data.apiKey;
+          }
+        } catch (keyError) {
+          console.error("Failed to generate API key:", keyError);
+        }
         window.history.replaceState({}, document.title, "/"); // Clean up the URL
       }
 
-      setSession({ user, apiKey });
-      if (apiKey) fetchHistoryData();
+      setSession({ user, apiKey, accessToken });
+      if (apiKey) fetchHistoryData(apiKey);
     } catch (error) {
       console.error("Failed to load user API key:", error);
     }
@@ -103,21 +125,21 @@ export default function App() {
   useEffect(() => {
     if (!IS_CLOUD_SAAS) {
       fetchScanData();
+      fetchDbStatus();
     }
-    fetchDbStatus();
 
     if (IS_CLOUD_SAAS) {
       // Check active session and fetch API key on page load
       supabase.auth.getSession().then(({ data: { session } }) => {
         if (session && session.user) {
-          fetchAndSetUserSession(session.user);
+          fetchAndSetUserSession(session);
         }
       });
 
       // Listen for auth changes (e.g., logging in, or logging out from another tab)
       const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
         if (session && session.user) {
-          fetchAndSetUserSession(session.user);
+          fetchAndSetUserSession(session);
         } else {
           setSession(null);
         }
@@ -129,7 +151,10 @@ export default function App() {
 
   const fetchHistoricalProof = async (hash) => {
     try {
-      const response = await fetch(`${API_BASE_URL}/api/proof?hash=${hash}`);
+      const headers = {};
+      if (session && session.apiKey) headers["Authorization"] = `Bearer ${session.apiKey}`;
+
+      const response = await fetch(`${API_BASE_URL}/api/proof?hash=${hash}`, { headers });
       if (response.ok) {
         const data = await response.json();
         setHistoricalProof({ hash, markdown: data.markdown });
@@ -145,17 +170,20 @@ export default function App() {
     
     try {
       if (dbConfig.connected) {
+        const headers = { "Content-Type": "application/json" };
+        if (session && session.apiKey) headers["Authorization"] = `Bearer ${session.apiKey}`;
+
         // Send current state to the Go backend to store in Supabase
         const response = await fetch(`${API_BASE_URL}/api/save-proof`, {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: headers,
           body: JSON.stringify(scanData)
         });
         
         if (response.ok) {
           setMarkdownGenerated(true);
           setHistoricalProof(null); // Clear any currently viewed history
-          fetchHistoryData(); // Refresh history table after saving
+          fetchHistoryData(session ? session.apiKey : ""); // Refresh history table after saving
         } else {
           console.error("Failed to save proof drill");
         }
@@ -177,19 +205,22 @@ export default function App() {
     setAuthForm({ ...authForm, loading: true });
     
     try {
+      let authError = null;
       if (isSignUp) {
         const { error } = await supabase.auth.signUp({
           email: authForm.email,
           password: authForm.password,
         });
-        if (error) throw error;
+        authError = error;
       } else {
         const { error } = await supabase.auth.signInWithPassword({
           email: authForm.email,
           password: authForm.password,
         });
-        if (error) throw error;
+        authError = error;
       }
+
+      if (authError) throw authError;
 
     } catch (err) {
       alert(err.message);
@@ -201,10 +232,14 @@ export default function App() {
   const handleCheckout = async () => {
     setIsCheckoutLoading(true);
     try {
+      // The backend derives userID + email from the verified Supabase JWT,
+      // so there is no need to (and no point in) supplying them in the body.
       const response = await fetch(`${API_BASE_URL}/api/create-checkout-session`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ userEmail: session.user.email, userID: session.user.id })
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${session.accessToken}`,
+        },
       });
 
       if (!response.ok) {
@@ -313,32 +348,78 @@ ${scanData.complianceStatus === 'Passed' ? '- [x] High-risk dependency constrain
       {/* CLOUD SAAS VIEW */}
       {IS_CLOUD_SAAS ? (
         !session ? (
-          /* Authentication Screen */
-          <div className="max-w-md mx-auto mt-16 bg-white p-8 rounded-2xl shadow-sm border border-slate-200 animate-in fade-in zoom-in-95 duration-300">
-            <div className="text-center mb-8">
-              <div className="w-16 h-16 bg-indigo-100 rounded-full flex items-center justify-center mx-auto mb-4">
-                <Shield className="w-8 h-8 text-indigo-600" />
+          /* Public Landing Page & Authentication */
+          <div className="max-w-6xl mx-auto mt-8 animate-in fade-in duration-500">
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-12 items-center">
+              
+              {/* Marketing Copy */}
+              <div className="space-y-6">
+                <div className="inline-flex items-center gap-2 px-3 py-1 bg-indigo-100 text-indigo-700 text-sm font-bold rounded-full">
+                  <Shield className="w-4 h-4" /> EU AI Act Ready
+                </div>
+                <h2 className="text-4xl lg:text-5xl font-extrabold text-slate-900 leading-tight">
+                  Secure your AI supply chain. <span className="text-indigo-600">Automate compliance.</span>
+                </h2>
+                <p className="text-lg text-slate-600 leading-relaxed">
+                  Every AI system shipped to the EU market must comply with the AI Act by August 2026. AIcap runs natively inside your CI/CD pipeline to generate your AI-BOM, track risks, and maintain an Immutable Audit Ledger.
+                </p>
+                <div className="space-y-4 pt-4">
+                  <div className="flex items-start gap-3">
+                    <CheckCircle className="w-6 h-6 text-emerald-500 shrink-0" />
+                    <p className="text-slate-700"><strong>Shift-Left Compliance:</strong> Automatic Annex IV documentation generation.</p>
+                  </div>
+                  <div className="flex items-start gap-3">
+                    <CheckCircle className="w-6 h-6 text-emerald-500 shrink-0" />
+                    <p className="text-slate-700"><strong>DevSecOps Ready:</strong> Native CycloneDX SBOM & OWASP ML Top 10 enrichment.</p>
+                  </div>
+                  <div className="flex items-start gap-3">
+                    <CheckCircle className="w-6 h-6 text-emerald-500 shrink-0" />
+                    <p className="text-slate-700"><strong>FinOps Tracking:</strong> Identify expensive unoptimized GPU requests before deployment.</p>
+                  </div>
+                </div>
               </div>
-              <h2 className="text-2xl font-bold text-slate-900">Sign in to AIcap Pro</h2>
-              <p className="text-slate-500 text-sm mt-2">Access your immutable audit ledger and manage your pipeline API keys.</p>
+
+              {/* Login/Signup Form */}
+              <div className="bg-white p-8 rounded-2xl shadow-[0_8px_30px_rgb(0,0,0,0.12)] border border-slate-100 relative">
+                <div className="absolute -top-6 -right-6 text-7xl opacity-5">🛡️</div>
+                <div className="text-center mb-8 relative z-10">
+                  <h3 className="text-2xl font-bold text-slate-900">{isSignUp ? 'Start your Pro trial' : 'Sign in to AIcap Pro'}</h3>
+                  <p className="text-slate-500 text-sm mt-2">{isSignUp ? 'Generate your API key and connect your repositories.' : 'Access your immutable audit ledger.'}</p>
+                </div>
+                <form onSubmit={handleAuth} className="space-y-5 relative z-10">
+                  <div>
+                    <label className="block text-sm font-medium text-slate-700 mb-1.5">Work Email</label>
+                    <input type="email" required value={authForm.email} onChange={e => setAuthForm({...authForm, email: e.target.value})} className="w-full p-3 border border-slate-300 rounded-lg focus:ring-2 focus:ring-indigo-500 outline-none transition" placeholder="devsecops@company.com" />
+                  </div>
+                  <div>
+                    <label className="block text-sm font-medium text-slate-700 mb-1.5">Password</label>
+                    <input type="password" required value={authForm.password} onChange={e => setAuthForm({...authForm, password: e.target.value})} className="w-full p-3 border border-slate-300 rounded-lg focus:ring-2 focus:ring-indigo-500 outline-none transition" placeholder="••••••••" />
+                  </div>
+                  <button type="submit" disabled={authForm.loading} className="w-full bg-indigo-600 text-white font-bold py-3.5 rounded-lg hover:bg-indigo-700 transition disabled:opacity-50 mt-4 shadow-md shadow-indigo-200">
+                    {authForm.loading ? 'Authenticating...' : (isSignUp ? 'Create Free Account' : 'Sign In')}
+                  </button>
+                </form>
+                <div className="mt-6 text-center relative z-10">
+                  <p className="text-slate-500 text-sm mb-2">
+                    {isSignUp ? 'Already have an account?' : "Don't have an account yet?"}
+                  </p>
+                  <button onClick={() => setIsSignUp(!isSignUp)} className="text-sm text-indigo-600 hover:text-indigo-800 font-bold transition">
+                    {isSignUp ? 'Sign In' : 'Sign up for AIcap Pro'}
+                  </button>
+                </div>
+              </div>
             </div>
-            <form onSubmit={handleAuth} className="space-y-5">
-              <div>
-                <label className="block text-sm font-medium text-slate-700 mb-1.5">Work Email</label>
-                <input type="email" required value={authForm.email} onChange={e => setAuthForm({...authForm, email: e.target.value})} className="w-full p-2.5 border border-slate-300 rounded-lg focus:ring-2 focus:ring-indigo-500 outline-none transition" placeholder="you@company.com" />
-              </div>
-              <div>
-                <label className="block text-sm font-medium text-slate-700 mb-1.5">Password</label>
-                <input type="password" required value={authForm.password} onChange={e => setAuthForm({...authForm, password: e.target.value})} className="w-full p-2.5 border border-slate-300 rounded-lg focus:ring-2 focus:ring-indigo-500 outline-none transition" placeholder="••••••••" />
-              </div>
-              <button type="submit" disabled={authForm.loading} className="w-full bg-indigo-600 text-white font-bold py-3 rounded-lg hover:bg-indigo-700 transition disabled:opacity-50 mt-2">
-                {authForm.loading ? 'Authenticating...' : (isSignUp ? 'Create Account' : 'Sign In')}
-              </button>
-            </form>
-            <div className="mt-4 text-center">
-              <button onClick={() => setIsSignUp(!isSignUp)} className="text-sm text-indigo-600 hover:text-indigo-800 font-medium">
-                {isSignUp ? 'Already have an account? Sign In' : 'Need an account? Sign Up'}
-              </button>
+            
+            {/* Trust/Social Proof Section */}
+            <div className="mt-20 pt-10 border-t border-slate-200 text-center pb-10">
+               <p className="text-sm font-bold text-slate-400 uppercase tracking-widest mb-6">Built for Modern Tech Stacks</p>
+               <div className="flex flex-wrap justify-center gap-8 md:gap-16 opacity-60 grayscale filter">
+                 <span className="text-xl font-bold font-mono">Python</span>
+                 <span className="text-xl font-bold font-mono">Node.js</span>
+                 <span className="text-xl font-bold font-mono">Golang</span>
+                 <span className="text-xl font-bold font-mono">Kubernetes</span>
+                 <span className="text-xl font-bold font-mono">Terraform</span>
+               </div>
             </div>
           </div>
         ) : (
@@ -380,7 +461,7 @@ ${scanData.complianceStatus === 'Passed' ? '- [x] High-risk dependency constrain
                 <div className="mt-6 bg-slate-900/80 p-4 rounded-lg font-mono text-sm text-indigo-300 overflow-x-auto border border-indigo-500/30">
                   <p className="text-slate-500 mb-2"># Add this to your .github/workflows/build.yml</p>
                   <p><span className="text-pink-400">-</span> <span className="text-blue-400">name</span>: Run EU AI Act Compliance Scan</p>
-                  <p>  <span className="text-blue-400">uses</span>: istrategeorge/AIcap@v1.0.0-alpha</p>
+                  <p>  <span className="text-blue-400">uses</span>: istrategeorge/AIcap@v1.0.0-beta</p>
                   <p>  <span className="text-blue-400">with</span>:</p>
                   <p>    <span className="text-blue-400">api-key</span>: {'${{ secrets.AICAP_API_KEY }}'}</p>
                 </div>

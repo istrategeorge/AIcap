@@ -1,0 +1,26 @@
+# AIcap Policy Configuration
+# This file defines the policy-as-code rules for your AI compliance posture.
+# Place this file in the root of your repository to enforce policies during CI/CD scans.
+
+# Models that are explicitly approved for use in this project.
+# If specified, any model NOT in this list will trigger a Blocker violation.
+# allowed_models:
+#   - gpt-4
+#   - claude-3
+#   - llama-3
+
+# Models that are explicitly blocked from use in this project.
+blocked_models:
+  - gpt-3.5-turbo
+
+# Block the pipeline if any High-risk dependency is detected without mitigation
+block_on_high_risk: false
+
+# Require all high-risk dependencies to have license information
+require_licenses: true
+
+# Only allow these licenses for AI components
+# allowed_licenses:
+#   - MIT
+#   - Apache-2.0
+#   - llama3.1
