@@ -12,12 +12,38 @@ import (
 
 	"aicap/pkg/api"
 	"aicap/pkg/compliance"
+	"aicap/pkg/migrate"
 	"aicap/pkg/scanner"
 
 	_ "github.com/lib/pq"
 )
 
 func main() {
+	// --migrate runs schema migrations against SUPABASE_DB_URL and exits.
+	// Intended for use as a pre-deploy step or a one-shot local command. We
+	// also auto-run migrations at server boot when RUN_MIGRATIONS=true, but a
+	// dedicated subcommand is useful for CI pipelines that want to fail the
+	// deploy before the new binary starts taking traffic.
+	if len(os.Args) > 1 && os.Args[1] == "--migrate" {
+		dbURL := os.Getenv("SUPABASE_DB_URL")
+		if dbURL == "" {
+			log.Fatal("--migrate requires SUPABASE_DB_URL to be set")
+		}
+		db, err := sql.Open("postgres", dbURL)
+		if err != nil {
+			log.Fatalf("open db: %v", err)
+		}
+		defer db.Close()
+		if err := db.Ping(); err != nil {
+			log.Fatalf("ping db: %v", err)
+		}
+		if err := migrate.Apply(db); err != nil {
+			log.Fatalf("migrate: %v", err)
+		}
+		fmt.Println("migrations applied")
+		return
+	}
+
 	// Headless CLI Mode for CI/CD Pipelines
 	if len(os.Args) > 1 && os.Args[1] == "--cli" {
 		scanDir := "."
@@ -106,6 +132,18 @@ func main() {
 			log.Fatalf("Error connecting to database: %v", err)
 		}
 		fmt.Println("Connected to Supabase PostgreSQL successfully!")
+
+		// RUN_MIGRATIONS=true tells the server to apply any pending schema
+		// migrations before it starts accepting traffic. Opt-in (not default)
+		// because some deployment flows prefer a separate `aicap --migrate`
+		// step in CI so a bad migration fails the pipeline rather than a
+		// running pod. Safe to enable on the staging/Render setup where a
+		// single instance boots on each deploy.
+		if os.Getenv("RUN_MIGRATIONS") == "true" {
+			if err := migrate.Apply(db); err != nil {
+				log.Fatalf("Error applying migrations: %v", err)
+			}
+		}
 	} else {
 		if os.Getenv("RENDER") == "true" || os.Getenv("VERCEL") == "true" {
 			log.Fatal("Error: SUPABASE_DB_URL is not set in cloud environment. Database connection required for SaaS features.")

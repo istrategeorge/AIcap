@@ -1,0 +1,42 @@
+# Local-dev and integration-test Postgres. `docker compose up db` gives the
+# running server and the Go test suite a real database to talk to without
+# needing Supabase credentials. The `aicap` service is optional — most dev
+# loops prefer `go run .` on the host so file changes are picked up without
+# a rebuild, but it's here for anyone who wants a fully containerised run.
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: aicap
+      POSTGRES_PASSWORD: aicap
+      POSTGRES_DB: aicap
+    ports:
+      - "5432:5432"
+    # pg_isready inside the container — lets dependents use
+    # `depends_on: db: condition: service_healthy` to avoid the race where
+    # the server boots before Postgres is accepting connections.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aicap -d aicap"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+    volumes:
+      - aicap_pgdata:/var/lib/postgresql/data
+
+  aicap:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      # Use the same URL the tests and dev CLI use so `aicap --migrate`
+      # targets this service cleanly.
+      SUPABASE_DB_URL: postgres://aicap:aicap@db:5432/aicap?sslmode=disable
+      RUN_MIGRATIONS: "true"
+      PORT: "8080"
+    ports:
+      - "8080:8080"
+
+volumes:
+  aicap_pgdata:

@@ -148,26 +148,32 @@ func RegisterRoutes(mux *http.ServeMux, db *sql.DB, isCloudSaaS bool) {
 		}
 
 		userID := auth.UserID(r)
-		apiKey := auth.APIKey(r)
 		tier := auth.SubscriptionTier(r)
 
-		// Re-read scans_this_month inside the handler so the rate-limit check
-		// and increment are as close to atomic as we can get without a tx.
-		var scansUsed int
-		if err := db.QueryRow(
-			"SELECT COALESCE(scans_this_month, 0) FROM api_keys WHERE token = $1", apiKey,
-		).Scan(&scansUsed); err != nil {
-			http.Error(w, "Unauthorized: invalid API key", http.StatusUnauthorized)
-			return
-		}
-		if tier == "free" && scansUsed >= 10 {
-			http.Error(w, "Payment Required: Free tier limit of 10 cloud syncs reached. Please upgrade to Pro.", http.StatusPaymentRequired)
-			return
-		}
-		if _, err := db.Exec(
-			"UPDATE api_keys SET scans_this_month = scans_this_month + 1 WHERE token = $1", apiKey,
-		); err != nil {
-			log.Printf("Failed to increment usage tracking for API Key: %v", err)
+		// Rate-limit check: rolling 30-day count of the caller's own proof
+		// drills. This supersedes the old `api_keys.scans_this_month` counter,
+		// which required a monthly reset job we never shipped — so free-tier
+		// users hit a permanent ceiling after their first 10 scans.
+		//
+		// Counting rows is O(log n) per lookup thanks to the composite index
+		// on (user_id, created_at) added by migration 00006. No counter means
+		// no reset job, no writer contention on UPDATE, and no race where a
+		// scan is recorded but the counter increment fails.
+		if tier == "free" {
+			var recent int
+			if err := db.QueryRow(
+				`SELECT COUNT(*) FROM proof_drills
+				 WHERE user_id = $1 AND created_at > NOW() - INTERVAL '30 days'`,
+				userID,
+			).Scan(&recent); err != nil {
+				log.Printf("rate-limit check failed for user %s: %v", userID, err)
+				http.Error(w, "Database error", http.StatusInternalServerError)
+				return
+			}
+			if recent >= 10 {
+				http.Error(w, "Payment Required: Free tier limit of 10 cloud syncs per 30 days reached. Please upgrade to Pro.", http.StatusPaymentRequired)
+				return
+			}
 		}
 
 		var bom types.AIBOM

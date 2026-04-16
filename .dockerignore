@@ -1,0 +1,16 @@
+# Keep the build context small — the whole thing is uploaded to the daemon
+# on every `docker build`. Skip everything the Go toolchain doesn't need.
+.git
+.github
+.claude
+.backup
+documentation
+frontend/node_modules
+frontend/dist
+testing_files
+*.exe
+aicap-linux-amd64
+*.log
+*.md
+!README.md
+split_*.py
