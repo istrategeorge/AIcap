@@ -46,6 +46,15 @@ func RegisterRoutes(mux *http.ServeMux, db *sql.DB, isCloudSaaS bool) {
 		}
 	}
 
+	// withCORS guarantees CORS origin headers are appended before subsequent
+	// middleware (e.g. auth validation) can intercept and throw an early HTTP error.
+	withCORS := func(next http.HandlerFunc) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			cors(w, r)
+			next(w, r)
+		}
+	}
+
 	// --- Health --------------------------------------------------------------
 	// /healthz is used by Render/K8s liveness probes. It reports DB status
 	// without leaking any configuration details.
@@ -205,7 +214,7 @@ func RegisterRoutes(mux *http.ServeMux, db *sql.DB, isCloudSaaS bool) {
 		json.NewEncoder(w).Encode(map[string]string{"status": "success"})
 	}
 	if isCloudSaaS {
-		mux.HandleFunc("/api/save-proof", auth.RequireAPIKey(db, saveProof))
+		mux.HandleFunc("/api/save-proof", withCORS(auth.RequireAPIKey(db, saveProof)))
 	} else {
 		mux.HandleFunc("/api/save-proof", saveProof)
 	}
@@ -269,7 +278,7 @@ func RegisterRoutes(mux *http.ServeMux, db *sql.DB, isCloudSaaS bool) {
 		json.NewEncoder(w).Encode(records)
 	}
 	if isCloudSaaS {
-		mux.HandleFunc("/api/history", auth.RequireAPIKey(db, historyHandler))
+		mux.HandleFunc("/api/history", withCORS(auth.RequireAPIKey(db, historyHandler)))
 	} else {
 		mux.HandleFunc("/api/history", historyHandler)
 	}
@@ -321,7 +330,7 @@ func RegisterRoutes(mux *http.ServeMux, db *sql.DB, isCloudSaaS bool) {
 		json.NewEncoder(w).Encode(map[string]string{"markdown": markdown})
 	}
 	if isCloudSaaS {
-		mux.HandleFunc("/api/proof", auth.RequireAPIKey(db, proofHandler))
+		mux.HandleFunc("/api/proof", withCORS(auth.RequireAPIKey(db, proofHandler)))
 	} else {
 		mux.HandleFunc("/api/proof", proofHandler)
 	}
@@ -387,7 +396,7 @@ func RegisterRoutes(mux *http.ServeMux, db *sql.DB, isCloudSaaS bool) {
 		}
 		json.NewEncoder(w).Encode(map[string]string{"sessionId": checkoutSession.ID, "url": checkoutSession.URL})
 	}
-	mux.HandleFunc("/api/create-checkout-session", auth.RequireSupabaseJWT(checkoutHandler))
+	mux.HandleFunc("/api/create-checkout-session", withCORS(auth.RequireSupabaseJWT(checkoutHandler)))
 
 	// --- Stripe webhook -----------------------------------------------------
 	// The webhook itself is authenticated by Stripe's signature, not by us.
@@ -552,7 +561,7 @@ func RegisterRoutes(mux *http.ServeMux, db *sql.DB, isCloudSaaS bool) {
 		w.WriteHeader(http.StatusCreated)
 		json.NewEncoder(w).Encode(map[string]string{"apiKey": apiKey})
 	}
-	mux.HandleFunc("/api/generate-key", auth.RequireSupabaseJWT(generateKeyHandler))
+	mux.HandleFunc("/api/generate-key", withCORS(auth.RequireSupabaseJWT(generateKeyHandler)))
 }
 
 // parseAllowedOrigins splits a comma-separated VITE_FRONTEND_URL into a set of
@@ -601,3 +610,4 @@ func customerID(c *stripe.Customer) string {
 	}
 	return c.ID
 }
+
