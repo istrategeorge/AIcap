@@ -16,10 +16,12 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"strings"
+
+	"aicap/pkg/httplog"
 
 	"github.com/golang-jwt/jwt/v5"
 )
@@ -98,9 +100,13 @@ func RequireSupabaseJWT(next http.HandlerFunc) http.HandlerFunc {
 			next(w, r)
 			return
 		}
+		logger := httplog.From(r.Context())
 		token := bearerToken(r)
 		if token == "" {
-			log.Printf("auth: %s %s rejected — missing bearer token (origin=%q)", r.Method, r.URL.Path, r.Header.Get("Origin"))
+			logger.Info("auth rejected",
+				slog.String("reason", "missing bearer token"),
+				slog.String("origin", r.Header.Get("Origin")),
+			)
 			http.Error(w, "Unauthorized: missing bearer token", http.StatusUnauthorized)
 			return
 		}
@@ -110,11 +116,14 @@ func RequireSupabaseJWT(next http.HandlerFunc) http.HandlerFunc {
 			// token (client error) so the caller isn't misled into thinking
 			// their credentials are wrong when it's actually a config issue.
 			if os.Getenv("SUPABASE_JWT_SECRET") == "" {
-				log.Println("ERROR: SUPABASE_JWT_SECRET is not set — set this env var in your deployment to enable JWT auth")
+				logger.Error("SUPABASE_JWT_SECRET is not set — set this env var in your deployment to enable JWT auth")
 				http.Error(w, "Server configuration error: JWT secret not configured. Contact the service administrator.", http.StatusInternalServerError)
 				return
 			}
-			log.Printf("auth: %s %s rejected — JWT verify failed: %v", r.Method, r.URL.Path, err)
+			logger.Info("auth rejected",
+				slog.String("reason", "jwt verify failed"),
+				slog.Any("error", err),
+			)
 			http.Error(w, "Unauthorized: invalid or expired token", http.StatusUnauthorized)
 			return
 		}
@@ -167,15 +176,26 @@ func RequireAPIKey(db *sql.DB, next http.HandlerFunc) http.HandlerFunc {
 			next(w, r)
 			return
 		}
+		logger := httplog.From(r.Context())
 		token := bearerToken(r)
 		if token == "" {
-			log.Printf("auth: %s %s rejected — missing API key (origin=%q)", r.Method, r.URL.Path, r.Header.Get("Origin"))
+			logger.Info("auth rejected",
+				slog.String("reason", "missing api key"),
+				slog.String("origin", r.Header.Get("Origin")),
+			)
 			http.Error(w, "Unauthorized: missing API key", http.StatusUnauthorized)
 			return
 		}
 		rec, err := LookupAPIKey(db, token)
 		if err != nil {
-			log.Printf("auth: %s %s rejected — API key lookup failed: %v", r.Method, r.URL.Path, err)
+			// err here is either ErrUnauthorized (the common case — wrong key) or
+			// a real DB error. We log the message so the operator can distinguish,
+			// but the client always sees the same 401 so a timing side-channel
+			// can't probe for which keys exist.
+			logger.Info("auth rejected",
+				slog.String("reason", "api key lookup failed"),
+				slog.Any("error", err),
+			)
 			http.Error(w, "Unauthorized: invalid API key", http.StatusUnauthorized)
 			return
 		}

@@ -6,15 +6,15 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
-	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"strings"
 
 	"aicap/pkg/auth"
 	"aicap/pkg/compliance"
+	"aicap/pkg/httplog"
 	"aicap/pkg/scanner"
 	"aicap/pkg/types"
 
@@ -166,8 +166,9 @@ func RegisterRoutes(mux *http.ServeMux, db *sql.DB, isCloudSaaS bool) {
 				 WHERE user_id = $1 AND created_at > NOW() - INTERVAL '30 days'`,
 				userID,
 			).Scan(&recent); err != nil {
-				log.Printf("rate-limit check failed for user %s: %v", userID, err)
-				http.Error(w, "Database error", http.StatusInternalServerError)
+				httplog.From(r.Context()).Error("rate-limit check failed",
+					slog.String("user_id", userID), slog.Any("error", err))
+				http.Error(w, "Internal server error", http.StatusInternalServerError)
 				return
 			}
 			if recent >= 10 {
@@ -186,7 +187,8 @@ func RegisterRoutes(mux *http.ServeMux, db *sql.DB, isCloudSaaS bool) {
 			ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
 			RETURNING id`, bom.ProjectName).Scan(&projectID)
 		if err != nil {
-			http.Error(w, "Database error: "+err.Error(), http.StatusInternalServerError)
+			httplog.From(r.Context()).Error("upsert project failed", slog.Any("error", err))
+			http.Error(w, "Internal server error", http.StatusInternalServerError)
 			return
 		}
 
@@ -212,7 +214,8 @@ func RegisterRoutes(mux *http.ServeMux, db *sql.DB, isCloudSaaS bool) {
 			projectID, nullableUserID, commitSha, bomJSON, annexIVMarkdown, cryptoHash,
 		)
 		if err != nil {
-			http.Error(w, "Database error: "+err.Error(), http.StatusInternalServerError)
+			httplog.From(r.Context()).Error("insert proof_drill failed", slog.Any("error", err))
+			http.Error(w, "Internal server error", http.StatusInternalServerError)
 			return
 		}
 
@@ -270,7 +273,8 @@ func RegisterRoutes(mux *http.ServeMux, db *sql.DB, isCloudSaaS bool) {
 				LIMIT 25`)
 		}
 		if err != nil {
-			http.Error(w, "Database error: "+err.Error(), http.StatusInternalServerError)
+			httplog.From(r.Context()).Error("history query failed", slog.Any("error", err))
+			http.Error(w, "Internal server error", http.StatusInternalServerError)
 			return
 		}
 		defer rows.Close()
@@ -330,7 +334,8 @@ func RegisterRoutes(mux *http.ServeMux, db *sql.DB, isCloudSaaS bool) {
 			return
 		}
 		if err != nil {
-			http.Error(w, "Database error: "+err.Error(), http.StatusInternalServerError)
+			httplog.From(r.Context()).Error("proof query failed", slog.Any("error", err))
+			http.Error(w, "Internal server error", http.StatusInternalServerError)
 			return
 		}
 		json.NewEncoder(w).Encode(map[string]string{"markdown": markdown})
@@ -366,7 +371,7 @@ func RegisterRoutes(mux *http.ServeMux, db *sql.DB, isCloudSaaS bool) {
 
 		stripe.Key = os.Getenv("STRIPE_SECRET_KEY")
 		if stripe.Key == "" {
-			log.Println("STRIPE_SECRET_KEY is not set.")
+			httplog.From(r.Context()).Error("STRIPE_SECRET_KEY not set")
 			http.Error(w, "Stripe secret key not configured", http.StatusInternalServerError)
 			return
 		}
@@ -396,8 +401,11 @@ func RegisterRoutes(mux *http.ServeMux, db *sql.DB, isCloudSaaS bool) {
 		}
 		checkoutSession, err := session.New(params)
 		if err != nil {
-			log.Printf("Error creating checkout session: %v", err)
-			http.Error(w, fmt.Sprintf("Stripe Error: %v", err), http.StatusInternalServerError)
+			httplog.From(r.Context()).Error("creating Stripe checkout session", slog.Any("error", err))
+			// Do not leak the raw Stripe error to the browser — it can include
+			// internal IDs / customer hints. A generic message is enough for
+			// the client; ops has the request_id to correlate to the log line.
+			http.Error(w, "Unable to create checkout session. Please try again.", http.StatusBadGateway)
 			return
 		}
 		json.NewEncoder(w).Encode(map[string]string{"sessionId": checkoutSession.ID, "url": checkoutSession.URL})
@@ -420,16 +428,52 @@ func RegisterRoutes(mux *http.ServeMux, db *sql.DB, isCloudSaaS bool) {
 
 		const MaxBodyBytes = int64(65536)
 		r.Body = http.MaxBytesReader(w, r.Body, MaxBodyBytes)
+		logger := httplog.From(r.Context())
 		payload, err := io.ReadAll(r.Body)
 		if err != nil {
-			http.Error(w, fmt.Sprintf("Error reading request body: %v", err), http.StatusServiceUnavailable)
+			logger.Error("read webhook body", slog.Any("error", err))
+			http.Error(w, "Unable to read request body", http.StatusServiceUnavailable)
 			return
 		}
 		endpointSecret := os.Getenv("STRIPE_WEBHOOK_SECRET")
 		event, err := webhook.ConstructEvent(payload, r.Header.Get("stripe-signature"), endpointSecret)
 		if err != nil {
-			log.Printf("Error verifying webhook signature: %v", err)
+			logger.Error("verify webhook signature", slog.Any("error", err))
 			http.Error(w, "Webhook signature verification failed", http.StatusBadRequest)
+			return
+		}
+		// Add event-scoped fields to every log line for the rest of this
+		// request — makes it easy to pivot the log stream by stripe event.
+		logger = logger.With(slog.String("stripe_event_id", event.ID), slog.String("stripe_event_type", string(event.Type)))
+
+		// Idempotency guard. Stripe delivers each event at least once; a
+		// network blip on our 200 response triggers a retry 5 minutes later.
+		// We INSERT the event id up front — the PRIMARY KEY makes a second
+		// attempt fail with a unique-violation, at which point we return 200
+		// immediately without running the side effects a second time.
+		//
+		// Side effects (INSERT api_keys, UPDATE tier, DELETE api_keys) are
+		// not wrapped in the same transaction as the idempotency INSERT.
+		// The chosen trade-off: if we crash between "recorded the event" and
+		// "ran the side effect" we lose that event's effect. That is
+		// strictly safer than the inverse (running the side effect twice),
+		// and Stripe's dashboard lets an operator re-send any event by hand
+		// if we need recovery. Doing both in one tx would require moving the
+		// INSERT to the end, which reopens the double-apply window.
+		if _, err := db.Exec(
+			`INSERT INTO stripe_events (event_id, event_type) VALUES ($1, $2)`,
+			event.ID, event.Type,
+		); err != nil {
+			// pq encodes unique violations as SQLSTATE 23505. Any other
+			// error is a real DB problem and deserves a 500 so Stripe
+			// retries later rather than silently dropping the event.
+			if strings.Contains(err.Error(), "duplicate key") || strings.Contains(err.Error(), "23505") {
+				logger.Info("duplicate webhook event — ignoring replay")
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			logger.Error("record webhook event", slog.Any("error", err))
+			http.Error(w, "internal error", http.StatusInternalServerError)
 			return
 		}
 
@@ -437,15 +481,15 @@ func RegisterRoutes(mux *http.ServeMux, db *sql.DB, isCloudSaaS bool) {
 		case "checkout.session.completed":
 			var cs stripe.CheckoutSession
 			if err := json.Unmarshal(event.Data.Raw, &cs); err != nil {
-				log.Printf("Error parsing webhook JSON: %v", err)
+				logger.Error("parse checkout event", slog.Any("error", err))
 				http.Error(w, "Error parsing webhook JSON", http.StatusBadRequest)
 				return
 			}
 			userID := cs.Metadata["user_id"]
-			customerID := customerID(cs.Customer)
-			log.Printf("Checkout completed: customer=%s userID=%s", customerID, userID)
+			cid := customerID(cs.Customer)
+			logger.Info("checkout completed", slog.String("stripe_customer_id", cid), slog.String("user_id", userID))
 			if userID == "" {
-				log.Printf("checkout.session.completed missing user_id metadata — skipping provision")
+				logger.Warn("checkout.session.completed missing user_id metadata — skipping provision")
 				break
 			}
 
@@ -457,66 +501,70 @@ func RegisterRoutes(mux *http.ServeMux, db *sql.DB, isCloudSaaS bool) {
 					apiKey := "aicap_pro_sk_" + hex.EncodeToString(keyBytes)
 					if _, insertErr := db.Exec(
 						"INSERT INTO api_keys (user_id, token, stripe_customer_id, subscription_tier) VALUES ($1, $2, $3, 'pro')",
-						userID, apiKey, customerID,
+						userID, apiKey, cid,
 					); insertErr != nil {
-						log.Printf("Failed to provision API key for user %s: %v", userID, insertErr)
+						logger.Error("provision API key", slog.String("user_id", userID), slog.Any("error", insertErr))
 					} else {
-						log.Printf("API key provisioned (Pro Tier) for user %s", userID)
+						logger.Info("API key provisioned (Pro Tier)", slog.String("user_id", userID))
 					}
 				}
 			} else {
-				log.Printf("User %s already has an API key, upgrading to Pro", userID)
+				logger.Info("existing API key upgraded to Pro", slog.String("user_id", userID))
 				if _, updateErr := db.Exec(
 					"UPDATE api_keys SET subscription_tier = 'pro', stripe_customer_id = $1 WHERE user_id = $2",
-					customerID, userID,
+					cid, userID,
 				); updateErr != nil {
-					log.Printf("Failed to upgrade API key to Pro for user %s: %v", userID, updateErr)
+					logger.Error("upgrade API key", slog.String("user_id", userID), slog.Any("error", updateErr))
 				}
 			}
 
 		case "customer.subscription.deleted":
 			var sub stripe.Subscription
 			if err := json.Unmarshal(event.Data.Raw, &sub); err != nil {
-				log.Printf("Error parsing subscription deleted event: %v", err)
+				logger.Error("parse subscription deleted event", slog.Any("error", err))
 				break
 			}
 			cid := customerID(sub.Customer)
 			if cid == "" {
 				break
 			}
-			log.Printf("Subscription deleted for customer: %s", cid)
+			logger.Info("subscription deleted", slog.String("stripe_customer_id", cid))
 			result, err := db.Exec("DELETE FROM api_keys WHERE stripe_customer_id = $1", cid)
 			if err != nil {
-				log.Printf("Failed to revoke API key for customer %s: %v", cid, err)
+				logger.Error("revoke API key", slog.String("stripe_customer_id", cid), slog.Any("error", err))
 			} else {
 				rows, _ := result.RowsAffected()
-				log.Printf("Revoked %d API key(s) for customer %s", rows, cid)
+				logger.Info("API keys revoked", slog.String("stripe_customer_id", cid), slog.Int64("count", rows))
 			}
 
 		case "invoice.payment_failed":
 			var invoice stripe.Invoice
 			if err := json.Unmarshal(event.Data.Raw, &invoice); err != nil {
-				log.Printf("Error parsing invoice event: %v", err)
+				logger.Error("parse invoice event", slog.Any("error", err))
 				break
 			}
 			cid := customerID(invoice.Customer)
-			log.Printf("Payment failed: customer=%s invoice=%s attempt=%d",
-				cid, invoice.ID, invoice.AttemptCount)
+			logger.Warn("payment failed",
+				slog.String("stripe_customer_id", cid),
+				slog.String("invoice_id", invoice.ID),
+				slog.Int64("attempt", invoice.AttemptCount))
 			if cid != "" && invoice.AttemptCount >= 3 {
-				log.Printf("Max retry attempts reached for customer %s. Revoking API key.", cid)
+				logger.Warn("max retry attempts reached — revoking API key", slog.String("stripe_customer_id", cid))
 				db.Exec("DELETE FROM api_keys WHERE stripe_customer_id = $1", cid)
 			}
 
 		case "customer.subscription.updated":
 			var sub stripe.Subscription
 			if err := json.Unmarshal(event.Data.Raw, &sub); err != nil {
-				log.Printf("Error parsing subscription update event: %v", err)
+				logger.Error("parse subscription update event", slog.Any("error", err))
 				break
 			}
-			log.Printf("Subscription updated: customer=%s status=%s", customerID(sub.Customer), sub.Status)
+			logger.Info("subscription updated",
+				slog.String("stripe_customer_id", customerID(sub.Customer)),
+				slog.String("status", string(sub.Status)))
 
 		default:
-			log.Printf("Unhandled event type: %s", event.Type)
+			logger.Info("unhandled event type")
 		}
 
 		w.WriteHeader(http.StatusOK)
@@ -542,6 +590,7 @@ func RegisterRoutes(mux *http.ServeMux, db *sql.DB, isCloudSaaS bool) {
 		}
 
 		userID := auth.UserID(r)
+		logger := httplog.From(r.Context()).With(slog.String("user_id", userID))
 
 		var existingKey string
 		err := db.QueryRow("SELECT token FROM api_keys WHERE user_id = $1", userID).Scan(&existingKey)
@@ -549,10 +598,19 @@ func RegisterRoutes(mux *http.ServeMux, db *sql.DB, isCloudSaaS bool) {
 			json.NewEncoder(w).Encode(map[string]string{"apiKey": existingKey})
 			return
 		}
+		if err != sql.ErrNoRows {
+			// Non-ErrNoRows here means the DB is unhappy — don't fall through to
+			// INSERT because that will either error too or, worse, silently create
+			// a duplicate key for the same user.
+			logger.Error("lookup existing api key", slog.Any("error", err))
+			http.Error(w, "Internal server error", http.StatusInternalServerError)
+			return
+		}
 
 		keyBytes := make([]byte, 24)
 		if _, err := rand.Read(keyBytes); err != nil {
-			http.Error(w, "Failed to generate key", http.StatusInternalServerError)
+			logger.Error("generate api key bytes", slog.Any("error", err))
+			http.Error(w, "Internal server error", http.StatusInternalServerError)
 			return
 		}
 		apiKey := "aicap_pro_sk_" + hex.EncodeToString(keyBytes)
@@ -560,7 +618,8 @@ func RegisterRoutes(mux *http.ServeMux, db *sql.DB, isCloudSaaS bool) {
 		if _, err := db.Exec(
 			"INSERT INTO api_keys (user_id, token) VALUES ($1, $2)", userID, apiKey,
 		); err != nil {
-			http.Error(w, "Failed to store key: "+err.Error(), http.StatusInternalServerError)
+			logger.Error("store api key", slog.Any("error", err))
+			http.Error(w, "Internal server error", http.StatusInternalServerError)
 			return
 		}
 

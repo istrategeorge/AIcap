@@ -28,6 +28,7 @@ import (
 
 	"github.com/golang-jwt/jwt/v5"
 	_ "github.com/lib/pq"
+	"github.com/stripe/stripe-go/v79/webhook"
 )
 
 const jwtSecret = "integration-test-secret-do-not-use-in-prod"
@@ -56,7 +57,7 @@ func setup(t *testing.T) (*httptest.Server, *sql.DB) {
 	// Wipe every table this test suite touches. TRUNCATE … CASCADE handles
 	// the FK between proof_drills and projects, and RESTART IDENTITY zeroes
 	// any sequence so test assertions that depend on row counts are stable.
-	if _, err := db.Exec(`TRUNCATE proof_drills, projects, api_keys RESTART IDENTITY CASCADE`); err != nil {
+	if _, err := db.Exec(`TRUNCATE proof_drills, projects, api_keys, stripe_events RESTART IDENTITY CASCADE`); err != nil {
 		t.Fatalf("truncate: %v", err)
 	}
 
@@ -316,5 +317,130 @@ func TestGenerateKey_DerivesUserFromJWT(t *testing.T) {
 	}
 	if storedUser != userID {
 		t.Errorf("api_keys.user_id = %q, want %q", storedUser, userID)
+	}
+}
+
+// TestStripeWebhook_IdempotencyReplay is the contract for Wave 3's replay
+// protection: Stripe delivers each event at least once, so our handler must
+// treat a second delivery of the same event_id as a no-op.
+//
+// We drive this end-to-end through the real webhook endpoint (signature
+// verification and all) rather than unit-testing the INSERT logic directly,
+// because the bug we're defending against is the whole pipeline double-firing.
+// A `checkout.session.completed` event is used because it has an observable
+// side effect (inserts an api_keys row) — the assertion "one row after two
+// deliveries" would fail loudly if the guard ever regresses.
+func TestStripeWebhook_IdempotencyReplay(t *testing.T) {
+	const webhookSecret = "whsec_integration_test"
+	t.Setenv("STRIPE_WEBHOOK_SECRET", webhookSecret)
+	srv, db := setup(t)
+
+	userID := "00000000-0000-0000-0000-0000000000aa"
+	eventID := "evt_test_idem_replay_1"
+
+	// Minimal but valid Stripe event JSON. The handler extracts user_id from
+	// metadata and customer from cs.Customer; everything else is decoration.
+	// api_version must match what the installed stripe-go library expects or
+	// ConstructEvent rejects the payload before it ever reaches our handler.
+	payload := []byte(fmt.Sprintf(`{
+		"id": %q,
+		"object": "event",
+		"api_version": "2024-06-20",
+		"type": "checkout.session.completed",
+		"data": {
+			"object": {
+				"id": "cs_test_idem_1",
+				"object": "checkout.session",
+				"customer": "cus_test_idem_1",
+				"metadata": {"user_id": %q}
+			}
+		}
+	}`, eventID, userID))
+
+	send := func() int {
+		signed := webhook.GenerateTestSignedPayload(&webhook.UnsignedPayload{
+			Payload: payload,
+			Secret:  webhookSecret,
+		})
+		req, _ := http.NewRequest(http.MethodPost, srv.URL+"/api/stripe-webhook", bytes.NewReader(payload))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Stripe-Signature", signed.Header)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("post webhook: %v", err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	// First delivery: expect the full provision flow to run.
+	if code := send(); code != http.StatusOK {
+		t.Fatalf("first delivery status = %d, want 200", code)
+	}
+	var apiKeysAfter1 int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM api_keys WHERE user_id = $1`, userID).Scan(&apiKeysAfter1); err != nil {
+		t.Fatalf("count api_keys: %v", err)
+	}
+	if apiKeysAfter1 != 1 {
+		t.Fatalf("after first delivery: api_keys rows = %d, want 1 (side effect didn't run)", apiKeysAfter1)
+	}
+
+	// Second delivery: same event_id. The guard must short-circuit before
+	// any side effect runs, so api_keys stays at exactly one row.
+	if code := send(); code != http.StatusOK {
+		t.Fatalf("second delivery status = %d, want 200 (idempotency should still acknowledge)", code)
+	}
+	var apiKeysAfter2 int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM api_keys WHERE user_id = $1`, userID).Scan(&apiKeysAfter2); err != nil {
+		t.Fatalf("count api_keys after replay: %v", err)
+	}
+	if apiKeysAfter2 != 1 {
+		t.Errorf("after replay: api_keys rows = %d, want 1 — idempotency guard failed", apiKeysAfter2)
+	}
+
+	// And the stripe_events ledger records the event exactly once.
+	var eventsRows int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM stripe_events WHERE event_id = $1`, eventID).Scan(&eventsRows); err != nil {
+		t.Fatalf("count stripe_events: %v", err)
+	}
+	if eventsRows != 1 {
+		t.Errorf("stripe_events rows for %s = %d, want 1", eventID, eventsRows)
+	}
+}
+
+// TestStripeWebhook_RejectsBadSignature — belt-and-braces: an attacker
+// replaying a captured payload with the wrong secret must not even reach the
+// idempotency logic. 400 is the correct response per Stripe's docs, and it
+// prevents a bad actor from seeding fake event_ids into our stripe_events
+// table to block legitimate replays.
+func TestStripeWebhook_RejectsBadSignature(t *testing.T) {
+	t.Setenv("STRIPE_WEBHOOK_SECRET", "whsec_integration_test")
+	srv, db := setup(t)
+
+	payload := []byte(`{"id":"evt_bogus","object":"event","api_version":"2024-06-20","type":"checkout.session.completed","data":{"object":{}}}`)
+	signed := webhook.GenerateTestSignedPayload(&webhook.UnsignedPayload{
+		Payload: payload,
+		Secret:  "whsec_not_the_real_secret",
+	})
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/api/stripe-webhook", bytes.NewReader(payload))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Stripe-Signature", signed.Header)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", resp.StatusCode)
+	}
+
+	// No stripe_events row must have been inserted — the signature gate is
+	// strictly upstream of the idempotency INSERT.
+	var rows int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM stripe_events WHERE event_id = 'evt_bogus'`).Scan(&rows); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if rows != 0 {
+		t.Errorf("stripe_events inserted on bad signature: rows = %d, want 0", rows)
 	}
 }
