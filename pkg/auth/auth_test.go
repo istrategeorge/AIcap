@@ -180,6 +180,55 @@ func TestRequireSupabaseJWT_InjectsUserContext(t *testing.T) {
 	}
 }
 
+// TestRequireSupabaseJWT_LetsOptionsThrough guards the CORS preflight
+// passthrough. If this regresses, browsers will silently fail cross-origin
+// requests: the preflight returns 401 and the browser never sends the real
+// request, producing a "Failed to fetch" with a phantom 401 in the network tab.
+func TestRequireSupabaseJWT_LetsOptionsThrough(t *testing.T) {
+	t.Setenv("SUPABASE_JWT_SECRET", testSecret)
+	called := false
+	h := RequireSupabaseJWT(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		w.WriteHeader(http.StatusNoContent)
+	})
+
+	req := httptest.NewRequest(http.MethodOptions, "/api/create-checkout-session", nil)
+	req.Header.Set("Origin", "https://app.example.com")
+	req.Header.Set("Access-Control-Request-Method", "POST")
+	// Deliberately no Authorization header — that's the whole point of preflight.
+	w := httptest.NewRecorder()
+	h(w, req)
+
+	if !called {
+		t.Fatal("inner handler must run for OPTIONS preflight so it can emit CORS headers")
+	}
+	if w.Code == http.StatusUnauthorized {
+		t.Errorf("status = 401, OPTIONS preflight must not be auth-blocked")
+	}
+}
+
+func TestRequireAPIKey_LetsOptionsThrough(t *testing.T) {
+	called := false
+	// nil db is fine because OPTIONS should short-circuit before any lookup.
+	h := RequireAPIKey(nil, func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		w.WriteHeader(http.StatusNoContent)
+	})
+
+	req := httptest.NewRequest(http.MethodOptions, "/api/history", nil)
+	req.Header.Set("Origin", "https://app.example.com")
+	req.Header.Set("Access-Control-Request-Method", "GET")
+	w := httptest.NewRecorder()
+	h(w, req)
+
+	if !called {
+		t.Fatal("inner handler must run for OPTIONS preflight so it can emit CORS headers")
+	}
+	if w.Code == http.StatusUnauthorized {
+		t.Errorf("status = 401, OPTIONS preflight must not be auth-blocked")
+	}
+}
+
 func TestBearerToken(t *testing.T) {
 	cases := []struct {
 		header, want string

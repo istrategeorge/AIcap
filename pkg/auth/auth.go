@@ -85,10 +85,22 @@ func bearerToken(r *http.Request) string {
 //   - Missing/malformed Authorization header → 401 (client must supply credentials)
 //   - SUPABASE_JWT_SECRET not configured      → 500 (operator must set env var)
 //   - Expired or invalid token                → 401 (client must re-authenticate)
+//
+// CORS preflight (OPTIONS) requests pass through unauthenticated so the wrapped
+// handler can answer with the Access-Control-Allow-* headers the browser needs
+// before it will send the real request with its Authorization header. A
+// preflight has no Authorization header by design — rejecting it with 401
+// blocks the real request from ever being sent and surfaces as a browser-side
+// "Failed to fetch" with a misleading 401 in the network tab.
 func RequireSupabaseJWT(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodOptions {
+			next(w, r)
+			return
+		}
 		token := bearerToken(r)
 		if token == "" {
+			log.Printf("auth: %s %s rejected — missing bearer token (origin=%q)", r.Method, r.URL.Path, r.Header.Get("Origin"))
 			http.Error(w, "Unauthorized: missing bearer token", http.StatusUnauthorized)
 			return
 		}
@@ -102,6 +114,7 @@ func RequireSupabaseJWT(next http.HandlerFunc) http.HandlerFunc {
 				http.Error(w, "Server configuration error: JWT secret not configured. Contact the service administrator.", http.StatusInternalServerError)
 				return
 			}
+			log.Printf("auth: %s %s rejected — JWT verify failed: %v", r.Method, r.URL.Path, err)
 			http.Error(w, "Unauthorized: invalid or expired token", http.StatusUnauthorized)
 			return
 		}
@@ -145,15 +158,24 @@ func LookupAPIKey(db *sql.DB, key string) (*APIKeyRecord, error) {
 // RequireAPIKey is HTTP middleware that rejects requests without a valid
 // aicap_pro_sk_* API key in the Authorization header. On success the userID,
 // apiKey, and tier are injected into the request context.
+//
+// CORS preflight (OPTIONS) requests pass through unauthenticated; see the
+// comment on RequireSupabaseJWT for why.
 func RequireAPIKey(db *sql.DB, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodOptions {
+			next(w, r)
+			return
+		}
 		token := bearerToken(r)
 		if token == "" {
+			log.Printf("auth: %s %s rejected — missing API key (origin=%q)", r.Method, r.URL.Path, r.Header.Get("Origin"))
 			http.Error(w, "Unauthorized: missing API key", http.StatusUnauthorized)
 			return
 		}
 		rec, err := LookupAPIKey(db, token)
 		if err != nil {
+			log.Printf("auth: %s %s rejected — API key lookup failed: %v", r.Method, r.URL.Path, err)
 			http.Error(w, "Unauthorized: invalid API key", http.StatusUnauthorized)
 			return
 		}

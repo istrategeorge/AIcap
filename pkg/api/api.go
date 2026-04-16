@@ -216,6 +216,14 @@ func RegisterRoutes(mux *http.ServeMux, db *sql.DB, isCloudSaaS bool) {
 	// leak another tenant's ledger.
 	historyHandler := func(w http.ResponseWriter, r *http.Request) {
 		cors(w, r)
+		// Advertise the methods + headers the browser will actually use so the
+		// preflight response satisfies its CORS check. Without these, Chrome
+		// blocks the follow-up GET and the user sees a "Failed to fetch".
+		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		if r.Method == http.MethodOptions {
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		if db == nil {
 			http.Error(w, "Database not configured", http.StatusInternalServerError)
@@ -271,6 +279,11 @@ func RegisterRoutes(mux *http.ServeMux, db *sql.DB, isCloudSaaS bool) {
 	// caller's user_id in cloud mode so hash guessing can't cross tenants.
 	proofHandler := func(w http.ResponseWriter, r *http.Request) {
 		cors(w, r)
+		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		if r.Method == http.MethodOptions {
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		if db == nil {
 			http.Error(w, "Database not configured", http.StatusInternalServerError)
