@@ -229,9 +229,12 @@ func RegisterRoutes(mux *http.ServeMux, db *sql.DB, isCloudSaaS bool) {
 	}
 
 	// --- History ------------------------------------------------------------
-	// /api/history returns the caller's most recent proof drills. Requires an
-	// API key in cloud mode so we can scope results to their user_id and never
-	// leak another tenant's ledger.
+	// /api/history returns the caller's most recent proof drills. In cloud
+	// mode the route is gated by the user's Supabase session JWT — not their
+	// API key — because this is a dashboard read and the browser already has
+	// a JWT from supabase-js. API keys are for machines (the CI scanner);
+	// forcing the browser to send one would mean storing the raw key in
+	// localStorage, which is exactly the exposure Wave 3b closed.
 	historyHandler := func(w http.ResponseWriter, r *http.Request) {
 		cors(w, r)
 		// Advertise the methods + headers the browser will actually use so the
@@ -252,16 +255,14 @@ func RegisterRoutes(mux *http.ServeMux, db *sql.DB, isCloudSaaS bool) {
 		var err error
 		if isCloudSaaS {
 			userID := auth.UserID(r)
-			// Include rows where user_id IS NULL as a migration bridge:
-			// scans saved by the CLI before Wave 1 was deployed land with
-			// user_id = NULL. Once a user runs a fresh scan those rows get
-			// proper attribution; the NULL clause ensures the old ones stay
-			// visible in the meantime rather than silently disappearing.
+			// Strict tenant scope: the Wave 1 `OR user_id IS NULL` bridge is
+			// gone, and migration 00008 makes user_id NOT NULL in the DB so
+			// the predicate is exhaustive.
 			rows, err = db.Query(`
 				SELECT p.name, pd.commit_sha, pd.crypto_hash, pd.created_at
 				FROM proof_drills pd
 				JOIN projects p ON pd.project_id = p.id
-				WHERE pd.user_id = $1 OR pd.user_id IS NULL
+				WHERE pd.user_id = $1
 				ORDER BY pd.created_at DESC
 				LIMIT 25`, userID)
 		} else {
@@ -288,14 +289,17 @@ func RegisterRoutes(mux *http.ServeMux, db *sql.DB, isCloudSaaS bool) {
 		json.NewEncoder(w).Encode(records)
 	}
 	if isCloudSaaS {
-		mux.HandleFunc("/api/history", withCORS(auth.RequireAPIKey(db, historyHandler)))
+		mux.HandleFunc("/api/history", withCORS(auth.RequireSupabaseJWT(historyHandler)))
 	} else {
 		mux.HandleFunc("/api/history", historyHandler)
 	}
 
 	// --- Single proof -------------------------------------------------------
-	// /api/proof returns the Annex IV markdown for a given hash. Scoped to the
-	// caller's user_id in cloud mode so hash guessing can't cross tenants.
+	// /api/proof returns the Annex IV markdown for a given hash. Dashboard-
+	// only read, gated by the Supabase session JWT (same rationale as
+	// /api/history — browsers shouldn't carry API keys). Scoped strictly to
+	// the caller's user_id so someone who guesses a crypto_hash they did not
+	// produce cannot fetch another tenant's Annex IV.
 	proofHandler := func(w http.ResponseWriter, r *http.Request) {
 		cors(w, r)
 		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
@@ -318,10 +322,9 @@ func RegisterRoutes(mux *http.ServeMux, db *sql.DB, isCloudSaaS bool) {
 		var err error
 		if isCloudSaaS {
 			userID := auth.UserID(r)
-			// Same bridge as /api/history: allow fetching NULL-user_id rows
-			// that predate the Wave 1 attribution rollout.
+			// Exhaustive user_id predicate after Wave 3b: no more NULL bridge.
 			err = db.QueryRow(
-				"SELECT annex_iv_markdown FROM proof_drills WHERE crypto_hash = $1 AND (user_id = $2 OR user_id IS NULL)",
+				"SELECT annex_iv_markdown FROM proof_drills WHERE crypto_hash = $1 AND user_id = $2",
 				hash, userID,
 			).Scan(&markdown)
 		} else {
@@ -341,7 +344,7 @@ func RegisterRoutes(mux *http.ServeMux, db *sql.DB, isCloudSaaS bool) {
 		json.NewEncoder(w).Encode(map[string]string{"markdown": markdown})
 	}
 	if isCloudSaaS {
-		mux.HandleFunc("/api/proof", withCORS(auth.RequireAPIKey(db, proofHandler)))
+		mux.HandleFunc("/api/proof", withCORS(auth.RequireSupabaseJWT(proofHandler)))
 	} else {
 		mux.HandleFunc("/api/proof", proofHandler)
 	}
@@ -493,29 +496,28 @@ func RegisterRoutes(mux *http.ServeMux, db *sql.DB, isCloudSaaS bool) {
 				break
 			}
 
-			var existingKey string
-			err := db.QueryRow("SELECT token FROM api_keys WHERE user_id = $1", userID).Scan(&existingKey)
-			if err != nil {
-				keyBytes := make([]byte, 24)
-				if _, keyErr := rand.Read(keyBytes); keyErr == nil {
-					apiKey := "aicap_pro_sk_" + hex.EncodeToString(keyBytes)
-					if _, insertErr := db.Exec(
-						"INSERT INTO api_keys (user_id, token, stripe_customer_id, subscription_tier) VALUES ($1, $2, $3, 'pro')",
-						userID, apiKey, cid,
-					); insertErr != nil {
-						logger.Error("provision API key", slog.String("user_id", userID), slog.Any("error", insertErr))
-					} else {
-						logger.Info("API key provisioned (Pro Tier)", slog.String("user_id", userID))
-					}
-				}
+			// Wave 3b: the webhook no longer materialises a raw API key —
+			// the user never sees it if we do, because this runs server-side.
+			// Instead we upsert a row recording "Pro tier active" with a NULL
+			// token_hash; when the browser lands back on the success page it
+			// calls /api/generate-key, which UPDATEs the existing row with
+			// a fresh hash and returns the plaintext ONCE.
+			//
+			// ON CONFLICT (user_id) relies on the UNIQUE(user_id) constraint
+			// added in migration 00009. We only clobber the subscription
+			// fields — never touch token_hash here, so a user who already
+			// has a materialised key keeps it through a re-subscribe.
+			if _, err := db.Exec(
+				`INSERT INTO api_keys (user_id, stripe_customer_id, subscription_tier)
+				 VALUES ($1, $2, 'pro')
+				 ON CONFLICT (user_id) DO UPDATE
+				 SET stripe_customer_id = EXCLUDED.stripe_customer_id,
+				     subscription_tier  = 'pro'`,
+				userID, cid,
+			); err != nil {
+				logger.Error("mark user pro", slog.String("user_id", userID), slog.Any("error", err))
 			} else {
-				logger.Info("existing API key upgraded to Pro", slog.String("user_id", userID))
-				if _, updateErr := db.Exec(
-					"UPDATE api_keys SET subscription_tier = 'pro', stripe_customer_id = $1 WHERE user_id = $2",
-					cid, userID,
-				); updateErr != nil {
-					logger.Error("upgrade API key", slog.String("user_id", userID), slog.Any("error", updateErr))
-				}
+				logger.Info("user marked Pro (awaiting key materialisation)", slog.String("user_id", userID))
 			}
 
 		case "customer.subscription.deleted":
@@ -571,8 +573,20 @@ func RegisterRoutes(mux *http.ServeMux, db *sql.DB, isCloudSaaS bool) {
 	})
 
 	// --- API key issuance ---------------------------------------------------
-	// /api/generate-key returns (or creates) the authenticated user's API key.
-	// userID comes from the verified JWT, never from the request body.
+	// /api/generate-key implements the one-time-reveal model Wave 3b picked
+	// (GitHub / Stripe / AWS style). Called by the dashboard after a fresh
+	// user either signs up for free tier or lands back from Stripe checkout.
+	//
+	// Contract:
+	//   * 201 Created with {"apiKey": "<raw>"} when a brand-new key is
+	//     materialised. This is the ONLY moment the raw key leaves the
+	//     server — subsequent calls cannot re-read it because we only store
+	//     its SHA-256 hash.
+	//   * 409 Conflict when the user already has a materialised key. Client
+	//     is expected to offer "Rotate" (which revokes + reissues) rather
+	//     than silently re-displaying a key we no longer possess in plaintext.
+	//
+	// userID always comes from the verified JWT, never the request body.
 	generateKeyHandler := func(w http.ResponseWriter, r *http.Request) {
 		cors(w, r)
 		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
@@ -592,41 +606,125 @@ func RegisterRoutes(mux *http.ServeMux, db *sql.DB, isCloudSaaS bool) {
 		userID := auth.UserID(r)
 		logger := httplog.From(r.Context()).With(slog.String("user_id", userID))
 
-		var existingKey string
-		err := db.QueryRow("SELECT token FROM api_keys WHERE user_id = $1", userID).Scan(&existingKey)
-		if err == nil {
-			json.NewEncoder(w).Encode(map[string]string{"apiKey": existingKey})
-			return
-		}
-		if err != sql.ErrNoRows {
-			// Non-ErrNoRows here means the DB is unhappy — don't fall through to
-			// INSERT because that will either error too or, worse, silently create
-			// a duplicate key for the same user.
+		// Three possible states for api_keys.user_id = $1:
+		//   1. No row           → INSERT fresh (free-tier signup path)
+		//   2. Row with NULL hash → UPDATE hash (post-checkout webhook left
+		//                          a Pro marker; this materialises the key)
+		//   3. Row with non-NULL hash → 409 (already materialised; must rotate)
+		var existingHash sql.NullString
+		err := db.QueryRow(
+			`SELECT token_hash FROM api_keys WHERE user_id = $1`, userID,
+		).Scan(&existingHash)
+		if err != nil && err != sql.ErrNoRows {
 			logger.Error("lookup existing api key", slog.Any("error", err))
 			http.Error(w, "Internal server error", http.StatusInternalServerError)
 			return
 		}
+		if err == nil && existingHash.Valid && existingHash.String != "" {
+			// Case 3. The raw key is unrecoverable; force the client down the
+			// rotate path instead of silently re-issuing.
+			logger.Info("generate-key rejected: key already materialised")
+			http.Error(w, "API key already exists; rotate it to issue a new one", http.StatusConflict)
+			return
+		}
 
-		keyBytes := make([]byte, 24)
-		if _, err := rand.Read(keyBytes); err != nil {
+		rawKey, hashed, err := newAPIKey()
+		if err != nil {
 			logger.Error("generate api key bytes", slog.Any("error", err))
 			http.Error(w, "Internal server error", http.StatusInternalServerError)
 			return
 		}
-		apiKey := "aicap_pro_sk_" + hex.EncodeToString(keyBytes)
 
+		// Case 1 vs 2 handled by a single UPSERT. If the webhook pre-created
+		// a Pro marker (NULL hash), we fill it in and preserve the 'pro'
+		// tier; if there's no row at all, the INSERT path creates a 'free'
+		// key for a user who is generating before paying.
 		if _, err := db.Exec(
-			"INSERT INTO api_keys (user_id, token) VALUES ($1, $2)", userID, apiKey,
+			`INSERT INTO api_keys (user_id, token_hash, subscription_tier)
+			 VALUES ($1, $2, 'free')
+			 ON CONFLICT (user_id) DO UPDATE
+			 SET token_hash = EXCLUDED.token_hash`,
+			userID, hashed,
 		); err != nil {
 			logger.Error("store api key", slog.Any("error", err))
 			http.Error(w, "Internal server error", http.StatusInternalServerError)
 			return
 		}
 
+		logger.Info("api key materialised")
 		w.WriteHeader(http.StatusCreated)
-		json.NewEncoder(w).Encode(map[string]string{"apiKey": apiKey})
+		json.NewEncoder(w).Encode(map[string]string{"apiKey": rawKey})
 	}
 	mux.HandleFunc("/api/generate-key", withCORS(auth.RequireSupabaseJWT(generateKeyHandler)))
+
+	// --- API key rotation ---------------------------------------------------
+	// /api/rotate-key revokes the caller's current key and issues a fresh
+	// one. Same one-time-reveal contract as /api/generate-key — the new
+	// plaintext is only in this response body, never retrievable later.
+	//
+	// Idempotency: calling rotate when no row exists behaves identically
+	// to generate-key (creates a free-tier row). The existing tier is
+	// preserved on rotate so a Pro user doesn't accidentally downgrade.
+	rotateKeyHandler := func(w http.ResponseWriter, r *http.Request) {
+		cors(w, r)
+		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		if r.Method == "OPTIONS" {
+			return
+		}
+		if r.Method != "POST" {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if !isCloudSaaS || db == nil {
+			http.Error(w, "SaaS features require cloud deployment", http.StatusInternalServerError)
+			return
+		}
+
+		userID := auth.UserID(r)
+		logger := httplog.From(r.Context()).With(slog.String("user_id", userID))
+
+		rawKey, hashed, err := newAPIKey()
+		if err != nil {
+			logger.Error("generate api key bytes", slog.Any("error", err))
+			http.Error(w, "Internal server error", http.StatusInternalServerError)
+			return
+		}
+
+		// UPSERT rather than UPDATE so a user who never materialised a key
+		// before calling rotate still gets one. Tier is left untouched on
+		// the conflict path so a Pro user stays Pro.
+		if _, err := db.Exec(
+			`INSERT INTO api_keys (user_id, token_hash, subscription_tier)
+			 VALUES ($1, $2, 'free')
+			 ON CONFLICT (user_id) DO UPDATE
+			 SET token_hash = EXCLUDED.token_hash`,
+			userID, hashed,
+		); err != nil {
+			logger.Error("rotate api key", slog.Any("error", err))
+			http.Error(w, "Internal server error", http.StatusInternalServerError)
+			return
+		}
+
+		logger.Info("api key rotated")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{"apiKey": rawKey})
+	}
+	mux.HandleFunc("/api/rotate-key", withCORS(auth.RequireSupabaseJWT(rotateKeyHandler)))
+}
+
+// newAPIKey generates a fresh aicap_pro_sk_* token and returns both the raw
+// plaintext (to echo to the caller exactly once) and its SHA-256 hash (to
+// persist). Shared by /api/generate-key and /api/rotate-key to keep the
+// token prefix and hash algorithm in one place.
+func newAPIKey() (raw, hashed string, err error) {
+	keyBytes := make([]byte, 24)
+	if _, err = rand.Read(keyBytes); err != nil {
+		return "", "", err
+	}
+	raw = "aicap_pro_sk_" + hex.EncodeToString(keyBytes)
+	hashed = auth.HashAPIKey(raw)
+	return raw, hashed, nil
 }
 
 // parseAllowedOrigins splits a comma-separated VITE_FRONTEND_URL into a set of

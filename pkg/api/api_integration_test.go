@@ -13,7 +13,9 @@ package api_test
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -89,15 +91,19 @@ func mintJWT(t *testing.T, sub, email string) string {
 	return signed
 }
 
-// seedAPIKey inserts a Pro API key for `userID` and returns the token the
-// CLI would present. Using a fixed string (rather than the random hex the
-// handler produces) keeps test assertions deterministic.
+// seedAPIKey inserts a Pro API key for `userID` and returns the raw token the
+// CLI would present. After Wave 3b the database only stores the SHA-256 hash
+// (column: token_hash) — we hash at seed time, then hand the plaintext back
+// so the test can put it in an Authorization header. A deterministic token
+// string per user_id keeps assertions stable across runs.
 func seedAPIKey(t *testing.T, db *sql.DB, userID, tier string) string {
 	t.Helper()
 	token := fmt.Sprintf("aicap_pro_sk_test_%s", userID)
+	sum := sha256.Sum256([]byte(token))
+	hashed := hex.EncodeToString(sum[:])
 	if _, err := db.Exec(
-		`INSERT INTO api_keys (user_id, token, subscription_tier) VALUES ($1, $2, $3)`,
-		userID, token, tier,
+		`INSERT INTO api_keys (user_id, token_hash, subscription_tier) VALUES ($1, $2, $3)`,
+		userID, hashed, tier,
 	); err != nil {
 		t.Fatalf("seed api key: %v", err)
 	}
@@ -223,17 +229,23 @@ func TestSaveProof_FreeTierQuota(t *testing.T) {
 }
 
 // TestHistory_TenantScoping is the "do not leak the ledger" guarantee: two
-// users each save a proof; each /api/history call must see only its own row.
+// users each save a proof via the CLI path (API key) and read their
+// dashboard via the browser path (Supabase JWT). Each /api/history call
+// must see only its own row.
+//
+// The route swap in Wave 3b is the relevant regression: /api/history moved
+// from RequireAPIKey to RequireSupabaseJWT. If that swap broke tenant
+// scoping we'd see Alice's JWT returning Bob's rows.
 func TestHistory_TenantScoping(t *testing.T) {
 	srv, db := setup(t)
 	alice := "00000000-0000-0000-0000-000000000010"
 	bob := "00000000-0000-0000-0000-000000000020"
-	aliceToken := seedAPIKey(t, db, alice, "pro")
-	bobToken := seedAPIKey(t, db, bob, "pro")
+	aliceAPIKey := seedAPIKey(t, db, alice, "pro")
+	bobAPIKey := seedAPIKey(t, db, bob, "pro")
 
-	// Each user pushes one scan.
+	// CI path (still uses API keys): each user pushes one scan.
 	for _, p := range []struct{ tok, commit string }{
-		{aliceToken, "alice-sha"}, {bobToken, "bob-sha"},
+		{aliceAPIKey, "alice-sha"}, {bobAPIKey, "bob-sha"},
 	} {
 		b, _ := json.Marshal(types.AIBOM{ProjectName: "demo", CommitSha: p.commit})
 		req, _ := http.NewRequest(http.MethodPost, srv.URL+"/api/save-proof", bytes.NewReader(b))
@@ -246,9 +258,11 @@ func TestHistory_TenantScoping(t *testing.T) {
 		resp.Body.Close()
 	}
 
-	// Alice's /api/history must contain alice-sha and exactly one row.
+	// Dashboard path (Wave 3b: Supabase JWT): Alice's history must contain
+	// alice-sha and exactly one row.
+	aliceJWT := mintJWT(t, alice, "alice@example.com")
 	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/api/history", nil)
-	req.Header.Set("Authorization", "Bearer "+aliceToken)
+	req.Header.Set("Authorization", "Bearer "+aliceJWT)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("history: %v", err)
@@ -263,6 +277,134 @@ func TestHistory_TenantScoping(t *testing.T) {
 	}
 	if records[0].CommitSha != "alice-sha" {
 		t.Errorf("alice saw commit %q, want alice-sha", records[0].CommitSha)
+	}
+}
+
+// TestHistory_RejectsAPIKey is the explicit regression for Wave 3b's route
+// swap: a caller presenting a valid API key (CLI credential) must now be
+// rejected at the dashboard endpoint. This prevents accidental regression
+// back to the old model that stored raw keys in the browser.
+func TestHistory_RejectsAPIKey(t *testing.T) {
+	srv, db := setup(t)
+	userID := "00000000-0000-0000-0000-0000000000a1"
+	apiKey := seedAPIKey(t, db, userID, "pro")
+
+	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/api/history", nil)
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET /api/history: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("status = %d, want 401 (API key must not authenticate dashboard routes)", resp.StatusCode)
+	}
+}
+
+// TestGenerateKey_OneTimeReveal covers the Wave 3b one-time-reveal contract:
+//   - First call: 201 with a plaintext aicap_pro_sk_* key in the response body.
+//   - Second call (no rotation): 409 because the raw key is unrecoverable
+//     and we must not silently re-issue.
+//   - /api/rotate-key produces a *different* plaintext and leaves the DB
+//     with exactly one row for the user (UNIQUE(user_id) enforcement).
+//
+// The regression we're blocking: any path that returns a raw key by reading
+// it from the database. After migration 00009 the plaintext column is gone,
+// so such a path would have to materialise a new key every call — which is
+// exactly the silent-double-provision bug Wave 3b closed.
+func TestGenerateKey_OneTimeReveal(t *testing.T) {
+	srv, db := setup(t)
+	userID := "00000000-0000-0000-0000-0000000000b2"
+	tok := mintJWT(t, userID, "b@example.com")
+
+	call := func(path string) (int, string) {
+		req, _ := http.NewRequest(http.MethodPost, srv.URL+path, nil)
+		req.Header.Set("Authorization", "Bearer "+tok)
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("POST %s: %v", path, err)
+		}
+		defer resp.Body.Close()
+		var body struct{ APIKey string `json:"apiKey"` }
+		json.NewDecoder(resp.Body).Decode(&body)
+		return resp.StatusCode, body.APIKey
+	}
+
+	status, firstKey := call("/api/generate-key")
+	if status != http.StatusCreated {
+		t.Fatalf("first generate-key status = %d, want 201", status)
+	}
+	if firstKey == "" {
+		t.Fatal("first generate-key returned empty apiKey")
+	}
+
+	// Second call must refuse to re-issue — the raw key is gone from the
+	// server's point of view.
+	status, _ = call("/api/generate-key")
+	if status != http.StatusConflict {
+		t.Errorf("second generate-key status = %d, want 409", status)
+	}
+
+	// Rotation must produce a different plaintext.
+	status, rotatedKey := call("/api/rotate-key")
+	if status != http.StatusOK {
+		t.Fatalf("rotate-key status = %d, want 200", status)
+	}
+	if rotatedKey == firstKey {
+		t.Error("rotate-key returned the original key — rotation is a no-op")
+	}
+
+	// And the user still has exactly one row (UNIQUE(user_id) held).
+	var rows int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM api_keys WHERE user_id = $1`, userID).Scan(&rows); err != nil {
+		t.Fatalf("count rows: %v", err)
+	}
+	if rows != 1 {
+		t.Errorf("api_keys rows for user = %d, want 1", rows)
+	}
+}
+
+// TestGenerateKey_AfterCheckoutWebhook covers the handoff between the
+// Stripe webhook and the frontend's post-redirect generate-key call.
+// The webhook creates a Pro-tier row with NULL token_hash; the subsequent
+// generate-key call must materialise the hash and preserve the 'pro' tier
+// (not silently downgrade the user).
+func TestGenerateKey_AfterCheckoutWebhook(t *testing.T) {
+	srv, db := setup(t)
+	userID := "00000000-0000-0000-0000-0000000000b3"
+
+	// Simulate the webhook's effect directly — this test is about the
+	// generate-key handoff, not the webhook signature path.
+	if _, err := db.Exec(
+		`INSERT INTO api_keys (user_id, stripe_customer_id, subscription_tier)
+		 VALUES ($1, 'cus_test_handoff', 'pro')`, userID,
+	); err != nil {
+		t.Fatalf("simulate webhook upsert: %v", err)
+	}
+
+	tok := mintJWT(t, userID, "handoff@example.com")
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/api/generate-key", nil)
+	req.Header.Set("Authorization", "Bearer "+tok)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("generate-key: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status = %d, want 201", resp.StatusCode)
+	}
+
+	// Tier must still be 'pro' — the generate-key UPSERT must not clobber
+	// the subscription_tier the webhook recorded.
+	var tier string
+	if err := db.QueryRow(
+		`SELECT subscription_tier FROM api_keys WHERE user_id = $1`, userID,
+	).Scan(&tier); err != nil {
+		t.Fatalf("read tier: %v", err)
+	}
+	if tier != "pro" {
+		t.Errorf("tier after generate-key = %q, want pro (silent downgrade!)", tier)
 	}
 }
 

@@ -30,9 +30,18 @@ export default function App() {
   const [dbConfig, setDbConfig] = useState({ enabled: false, url: "", connected: false });
   const [dbConnecting, setDbConnecting] = useState(false);
   const [dbError, setDbError] = useState("");
-  
+
   // Auth State
+  // `session` after Wave 3b never contains a raw API key — only:
+  //   accessToken: Supabase session JWT (used for every authenticated backend call)
+  //   hasKey:      whether api_keys has a materialised token_hash for this user
+  //   tier:        'free' | 'pro' (drives paywall)
+  // The one-and-only time we know the raw key is inside `revealedKey`, which
+  // is populated by a successful /api/generate-key or /api/rotate-key response
+  // and cleared as soon as the user dismisses the reveal modal.
   const [session, setSession] = useState(null);
+  const [revealedKey, setRevealedKey] = useState("");
+  const [keyBusy, setKeyBusy] = useState(false);
   const [authForm, setAuthForm] = useState({ email: "", password: "", loading: false });
   const [isSignUp, setIsSignUp] = useState(false);
   const [isCheckoutLoading, setIsCheckoutLoading] = useState(false);
@@ -49,10 +58,12 @@ export default function App() {
     }
   };
 
-  // Fetch historical proof drills
-  const fetchHistoryData = async (keyOverride = "") => {
+  // Fetch historical proof drills. Authenticated with the Supabase session
+  // JWT (Wave 3b) — the backend derives user_id from the token's `sub`
+  // claim and scopes the query to the caller's rows only.
+  const fetchHistoryData = async (tokenOverride = "") => {
     try {
-      const token = keyOverride || (session ? session.apiKey : "");
+      const token = tokenOverride || (session ? session.accessToken : "");
       const headers = {};
       if (token) headers["Authorization"] = `Bearer ${token}`;
 
@@ -80,22 +91,38 @@ export default function App() {
     }
   };
 
-  // Fetch and set user session + API Key.
+  // Fetch and set user session.
+  // After Wave 3b we no longer pull the raw token from api_keys — the column
+  // doesn't exist anymore. We only read the subscription tier and whether a
+  // token_hash is materialised; the plaintext key is only ever visible in
+  // the response to /api/generate-key or /api/rotate-key.
+  //
   // `supabaseSession` is the object returned by supabase.auth (contains
-  // access_token). The backend uses that JWT to authenticate /api/generate-key
-  // — it derives userID from the token's `sub` claim, so the body is ignored.
+  // access_token). The backend uses that JWT to authenticate every route
+  // — it derives userID from the token's `sub` claim, so request bodies
+  // that claim a different user_id are ignored.
   const fetchAndSetUserSession = async (supabaseSession) => {
     const user = supabaseSession.user;
     const accessToken = supabaseSession.access_token;
     try {
-      let { data: keys } = await supabase.from('api_keys').select('token').eq('user_id', user.id);
-      let apiKey = keys && keys.length > 0 ? keys[0].token : "";
+      // RLS on api_keys lets a user read only their own row. We only
+      // need to know "does a token_hash exist?" + tier to drive UI state.
+      let { data: keys } = await supabase
+        .from('api_keys')
+        .select('token_hash, subscription_tier')
+        .eq('user_id', user.id);
+      const row = keys && keys.length > 0 ? keys[0] : null;
+      const hasKey = !!(row && row.token_hash);
+      const tier = row ? (row.subscription_tier || 'free') : 'free';
 
       const urlParams = new URLSearchParams(window.location.search);
       const sessionId = urlParams.get('session_id');
 
-      // Auto-provision key server-side if they just returned from a successful Stripe checkout
-      if (!apiKey && sessionId) {
+      let nextSession = { user, accessToken, hasKey, tier };
+
+      // Post-checkout return path: the webhook has marked the user Pro
+      // (token_hash still NULL), so materialise the key now and reveal it.
+      if (!hasKey && sessionId) {
         try {
           const response = await fetch(`${API_BASE_URL}/api/generate-key`, {
             method: "POST",
@@ -106,18 +133,75 @@ export default function App() {
           });
           if (response.ok) {
             const data = await response.json();
-            apiKey = data.apiKey;
+            setRevealedKey(data.apiKey);
+            nextSession = { ...nextSession, hasKey: true };
           }
         } catch (keyError) {
-          console.error("Failed to generate API key:", keyError);
+          console.error("Failed to materialise API key:", keyError);
         }
         window.history.replaceState({}, document.title, "/"); // Clean up the URL
       }
 
-      setSession({ user, apiKey, accessToken });
-      if (apiKey) fetchHistoryData(apiKey);
+      setSession(nextSession);
+      fetchHistoryData(accessToken);
     } catch (error) {
-      console.error("Failed to load user API key:", error);
+      console.error("Failed to load user session:", error);
+    }
+  };
+
+  // Manually materialise a key (free-tier self-signup path). Surfaces the
+  // raw key via `revealedKey`; the user must copy it before dismissing.
+  const handleGenerateKey = async () => {
+    if (!session) return;
+    setKeyBusy(true);
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/generate-key`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${session.accessToken}`,
+        },
+      });
+      if (response.status === 409) {
+        // Someone already has a key; offer rotate instead.
+        alert("An API key already exists. Use 'Rotate Key' to replace it.");
+        setSession({ ...session, hasKey: true });
+        return;
+      }
+      if (!response.ok) throw new Error(await response.text());
+      const data = await response.json();
+      setRevealedKey(data.apiKey);
+      setSession({ ...session, hasKey: true });
+    } catch (error) {
+      alert(`Failed to generate key: ${error.message}`);
+    } finally {
+      setKeyBusy(false);
+    }
+  };
+
+  // Rotate: revoke the existing key and issue a new one. One-time reveal.
+  const handleRotateKey = async () => {
+    if (!session) return;
+    if (!window.confirm(
+      "Rotating will immediately invalidate your current key. Any CI pipelines using it will start failing until you update the secret. Continue?"
+    )) return;
+    setKeyBusy(true);
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/rotate-key`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${session.accessToken}`,
+        },
+      });
+      if (!response.ok) throw new Error(await response.text());
+      const data = await response.json();
+      setRevealedKey(data.apiKey);
+      setSession({ ...session, hasKey: true });
+    } catch (error) {
+      alert(`Failed to rotate key: ${error.message}`);
+    } finally {
+      setKeyBusy(false);
     }
   };
 
@@ -152,7 +236,8 @@ export default function App() {
   const fetchHistoricalProof = async (hash) => {
     try {
       const headers = {};
-      if (session && session.apiKey) headers["Authorization"] = `Bearer ${session.apiKey}`;
+      // Wave 3b: dashboard route, authenticated with the Supabase JWT.
+      if (session && session.accessToken) headers["Authorization"] = `Bearer ${session.accessToken}`;
 
       const response = await fetch(`${API_BASE_URL}/api/proof?hash=${hash}`, { headers });
       if (response.ok) {
@@ -167,23 +252,24 @@ export default function App() {
 
   const handleGenerateAnnexIV = async () => {
     setIsGenerating(true);
-    
+
     try {
       if (dbConfig.connected) {
-        const headers = { "Content-Type": "application/json" };
-        if (session && session.apiKey) headers["Authorization"] = `Bearer ${session.apiKey}`;
-
-        // Send current state to the Go backend to store in Supabase
+        // This path fires only in LOCAL developer mode (isCloudSaaS=false)
+        // where the server runs without auth middleware — so no header is
+        // attached. In cloud mode the dashboard never reaches this code
+        // because /api/save-proof is a CI-pipeline endpoint and dbConfig
+        // is gated on the local-only /api/db-config toggle.
         const response = await fetch(`${API_BASE_URL}/api/save-proof`, {
           method: "POST",
-          headers: headers,
+          headers: { "Content-Type": "application/json" },
           body: JSON.stringify(scanData)
         });
-        
+
         if (response.ok) {
           setMarkdownGenerated(true);
           setHistoricalProof(null); // Clear any currently viewed history
-          fetchHistoryData(session ? session.apiKey : ""); // Refresh history table after saving
+          fetchHistoryData(); // Refresh history table after saving
         } else {
           console.error("Failed to save proof drill");
         }
@@ -423,7 +509,7 @@ ${scanData.complianceStatus === 'Passed' ? '- [x] High-risk dependency constrain
             </div>
           </div>
         ) : (
-          !session.apiKey ? (
+          session.tier !== 'pro' ? (
             /* Paywall / Upgrade Screen */
             <div className="max-w-lg mx-auto mt-16 bg-white p-8 rounded-2xl shadow-sm border border-slate-200 text-center animate-in fade-in zoom-in-95 duration-300">
               <div className="w-16 h-16 bg-amber-100 rounded-full flex items-center justify-center mx-auto mb-4">
@@ -467,16 +553,62 @@ ${scanData.complianceStatus === 'Passed' ? '- [x] High-risk dependency constrain
                 </div>
               </div>
               
-              {/* API Key Display Panel */}
-              <div className="bg-indigo-800/50 p-5 rounded-xl border border-indigo-400/30 w-full md:w-auto shrink-0">
+              {/* API Key Panel — one-time reveal model (Wave 3b).
+                 The plaintext key is only ever shown once, immediately after
+                 generation or rotation, and is stored nowhere the browser can
+                 re-read. If the user loses it, they rotate to issue a new one
+                 (which invalidates any key in their CI secrets). */}
+              <div className="bg-indigo-800/50 p-5 rounded-xl border border-indigo-400/30 w-full md:w-auto shrink-0 max-w-sm">
                 <div className="flex items-center gap-2 mb-3 text-indigo-100">
                   <Key className="w-4 h-4" />
-                  <h3 className="text-sm font-bold uppercase tracking-wider">Your Secret API Key</h3>
+                  <h3 className="text-sm font-bold uppercase tracking-wider">API Key</h3>
                 </div>
-                <code className="block bg-slate-900 text-emerald-400 px-4 py-2.5 rounded-lg text-sm select-all font-mono border border-slate-700">
-                  {session.apiKey}
-                </code>
-                <p className="text-indigo-200 text-xs mt-3 max-w-[240px]">Save this key in your GitHub repository secrets. Do not share it publicly.</p>
+                {revealedKey ? (
+                  <div>
+                    <code className="block bg-slate-900 text-emerald-400 px-4 py-2.5 rounded-lg text-xs select-all font-mono border border-emerald-500/40 break-all">
+                      {revealedKey}
+                    </code>
+                    <p className="text-amber-300 text-xs mt-3 font-semibold">
+                      Copy this key now. It will not be shown again.
+                    </p>
+                    <p className="text-indigo-200 text-xs mt-1">
+                      Paste it into your GitHub repository secrets as <code className="font-mono">AICAP_API_KEY</code>.
+                    </p>
+                    <button
+                      onClick={() => setRevealedKey("")}
+                      className="mt-4 w-full bg-emerald-600 text-white text-sm font-bold py-2 rounded-lg hover:bg-emerald-700 transition"
+                    >
+                      I've saved the key
+                    </button>
+                  </div>
+                ) : session.hasKey ? (
+                  <div>
+                    <p className="text-indigo-100 text-xs mb-3">
+                      An API key is active. The raw value cannot be shown again —
+                      if you lost it, rotate to issue a new one.
+                    </p>
+                    <button
+                      onClick={handleRotateKey}
+                      disabled={keyBusy}
+                      className="w-full bg-slate-900/60 text-white text-sm font-bold py-2 rounded-lg hover:bg-slate-900 transition disabled:opacity-50 border border-indigo-400/30"
+                    >
+                      {keyBusy ? 'Rotating…' : 'Rotate Key'}
+                    </button>
+                  </div>
+                ) : (
+                  <div>
+                    <p className="text-indigo-100 text-xs mb-3">
+                      Generate your API key to use the AIcap GitHub Action.
+                    </p>
+                    <button
+                      onClick={handleGenerateKey}
+                      disabled={keyBusy}
+                      className="w-full bg-emerald-600 text-white text-sm font-bold py-2 rounded-lg hover:bg-emerald-700 transition disabled:opacity-50"
+                    >
+                      {keyBusy ? 'Generating…' : 'Generate API Key'}
+                    </button>
+                  </div>
+                )}
               </div>
             </div>
 
