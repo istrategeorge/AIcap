@@ -561,7 +561,7 @@ func RegisterRoutes(mux *http.ServeMux, db *sql.DB, isCloudSaaS bool) {
 func parseAllowedOrigins(env string, isCloudSaaS bool) []string {
 	if env == "" {
 		if isCloudSaaS {
-			return []string{"https://aicap.vercel.app"}
+			return []string{"https://aicap.vercel.app", "https://*.vercel.app"}
 		}
 		return []string{"*"}
 	}
@@ -579,6 +579,13 @@ func isAllowedOrigin(origin string, allowed []string) bool {
 	for _, a := range allowed {
 		if a == "*" || a == origin {
 			return true
+		}
+		// Support dynamic wildcard subdomains (e.g., https://*.vercel.app)
+		if strings.HasPrefix(a, "https://*.") {
+			suffix := strings.TrimPrefix(a, "https://*")
+			if strings.HasPrefix(origin, "https://") && strings.HasSuffix(origin, suffix) {
+				return true
+			}
 		}
 	}
 	return false
