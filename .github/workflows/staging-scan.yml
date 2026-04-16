@@ -2,7 +2,7 @@ name: Staging AI-BOM Scanner
 
 on:
   push:
-    branches: [ "improvements" ]
+    branches: [ "development" ]
 
 jobs:
   security-scan:
