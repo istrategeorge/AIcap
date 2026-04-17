@@ -811,6 +811,54 @@ func RegisterRoutes(mux *http.ServeMux, db *sql.DB, isCloudSaaS bool) {
 		json.NewEncoder(w).Encode(map[string]string{"tier": "pro"})
 	}
 	mux.HandleFunc("/api/verify-checkout", withCORS(auth.RequireSupabaseJWT(verifyCheckoutHandler)))
+
+	// --- Session/profile read -----------------------------------------------
+	// /api/me returns the caller's subscription tier and whether their API
+	// key has been materialised. The frontend uses this instead of reading
+	// api_keys directly through the Supabase JS client so the read path does
+	// not depend on RLS policies being configured in the Supabase dashboard.
+	// Backend access bypasses RLS via the direct Postgres connection.
+	meHandler := func(w http.ResponseWriter, r *http.Request) {
+		cors(w, r)
+		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		if r.Method == "OPTIONS" {
+			return
+		}
+		if r.Method != "GET" {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if !isCloudSaaS || db == nil {
+			http.Error(w, "SaaS features require cloud deployment", http.StatusInternalServerError)
+			return
+		}
+
+		userID := auth.UserID(r)
+		logger := httplog.From(r.Context()).With(slog.String("user_id", userID))
+
+		var tokenHash sql.NullString
+		var tier sql.NullString
+		err := db.QueryRow(
+			`SELECT token_hash, subscription_tier FROM api_keys WHERE user_id = $1`,
+			userID,
+		).Scan(&tokenHash, &tier)
+		if err != nil && err != sql.ErrNoRows {
+			logger.Error("me lookup", slog.Any("error", err))
+			http.Error(w, "Internal server error", http.StatusInternalServerError)
+			return
+		}
+
+		resolvedTier := "free"
+		if tier.Valid && tier.String != "" {
+			resolvedTier = tier.String
+		}
+		json.NewEncoder(w).Encode(map[string]any{
+			"hasKey": tokenHash.Valid && tokenHash.String != "",
+			"tier":   resolvedTier,
+		})
+	}
+	mux.HandleFunc("/api/me", withCORS(auth.RequireSupabaseJWT(meHandler)))
 }
 
 // newAPIKey generates a fresh aicap_pro_sk_* token and returns both the raw

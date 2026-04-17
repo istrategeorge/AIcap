@@ -26,7 +26,7 @@ docker-compose.yml              # local Postgres for integration tests
 
 ## Branching model
 - `main` — stable / production
-- `development` — active work branch (current: `4ee14a4`)
+- `development` — active work branch (current: `d79d9fd`)
 - All PRs target `development` first, then merge to `main` for release
 
 ## Tech stack versions
@@ -41,7 +41,7 @@ Two distinct auth schemes, each for a different caller:
 
 | Caller | Scheme | Routes |
 |--------|--------|--------|
-| Browser (dashboard) | Supabase session JWT (`RequireSupabaseJWT`) | `/api/history`, `/api/proof`, `/api/create-checkout-session`, `/api/generate-key`, `/api/rotate-key` |
+| Browser (dashboard) | Supabase session JWT (`RequireSupabaseJWT`) | `/api/history`, `/api/proof`, `/api/create-checkout-session`, `/api/generate-key`, `/api/rotate-key`, `/api/verify-checkout`, `/api/me` |
 | CI pipeline | API key hash (`RequireAPIKey`) | `/api/save-proof` |
 
 **API keys are hashed at rest** (SHA-256, column `token_hash`). The plaintext is returned exactly once from `/api/generate-key` or `/api/rotate-key` and never stored. `HashAPIKey(raw)` in `pkg/auth` is the canonical hash function.
@@ -120,6 +120,34 @@ PORT                    HTTP port (default: 8080)
 - Stripe webhook: upserts Pro tier marker (NULL token_hash); frontend materialises key
 - Frontend: session shape is `{user, accessToken, hasKey, tier}` — no raw key in state
 
+### Wave 3c (on development — checkout flow hardening + RLS-independent reads)
+Commits: `f59e339`, `a2adeac`, `dd5d41f`, `ca9ff46`, `d79d9fd` — all on `development`.
+
+- **Checkout return race fixed**: `onAuthStateChange` was double-firing
+  `INITIAL_SESSION` + `TOKEN_REFRESHED`, causing two concurrent `/api/generate-key`
+  calls on the checkout-return URL (one 201, one 409). Fixed by removing the
+  separate `supabase.auth.getSession()` call and guarding `fetchAndSetUserSession`
+  with a `useRef(false)` latch.
+- **Checkout processing UI**: `checkoutProcessing` state is initialised from the
+  `session_id` URL param so the spinner shows immediately on page load, before
+  auth state fires. Render order checks `checkoutProcessing` BEFORE `!session`
+  so users don't flash the login screen between Stripe redirect and session mount.
+- **Webhook-independent verification**: new `GET /api/verify-checkout?session_id=…`
+  endpoint calls Stripe's API directly (`session.Get`), confirms
+  `Status == complete` (NOT `PaymentStatus == paid` — for `mode=subscription`
+  that can be `unpaid`/`no_payment_required` when the event fires), and upserts
+  Pro tier. This is the fallback when the Stripe webhook is misconfigured,
+  delayed, or simply not yet set up on a staging environment.
+- **Checkout-return fallback chain** (in `fetchAndSetUserSession`):
+  1. Call `/api/generate-key` to materialise the key (idempotent via 409).
+  2. Poll `/api/me` 3 × 1.5 s for `tier == 'pro'` (normal webhook path).
+  3. If still not Pro, call `/api/verify-checkout` (Stripe API fallback).
+- **`/api/me` endpoint**: returns `{hasKey, tier}` via the direct DB connection,
+  bypassing Supabase RLS. Frontend no longer reads `api_keys` through the
+  Supabase JS client, so session correctness does not depend on RLS policies
+  being configured in the Supabase dashboard. RLS stays enabled as
+  defense-in-depth (if the anon key leaks, it still blocks cross-tenant reads).
+
 ## Pending work (Wave 4)
 These items were explicitly deferred and not yet started:
 
@@ -133,20 +161,30 @@ These items were explicitly deferred and not yet started:
    has no `supabase.auth.onAuthStateChange` recovery path when a JWT expires
    mid-session (user sees silent 401s on dashboard calls)
 
-## Wave 3b deployment checklist (run before merging to main)
-- [ ] Verify Supabase RLS policy on `api_keys` covers `token_hash` + `subscription_tier`
-      columns (row-level policy `auth.uid() = user_id` is sufficient — no change needed
-      unless you had explicit column grants)
-- [ ] Run `SELECT * FROM pg_policies WHERE tablename = 'api_keys';` in Supabase SQL console
+## Wave 3b/3c deployment checklist (run before merging to main)
+- [ ] RLS can stay as-is after Wave 3c — the frontend no longer reads `api_keys`
+      directly, so `auth.uid() = user_id` row policies are sufficient as a
+      defense-in-depth layer. A missing SELECT policy would no longer break the UI.
 - [ ] Deploy with `RUN_MIGRATIONS=true` so 00008 + 00009 run against prod Supabase
 - [ ] Confirm `ALTER TABLE api_keys DROP COLUMN token` succeeded (migration 00009)
-- [ ] Test: log in → dashboard shows "Generate API Key" button → click → see key once
+- [ ] Test end-to-end: fresh signup → Stripe checkout → lands on Pro screen with
+      key revealed → refresh page → still on Pro screen (not paywall)
+- [ ] Test webhook fallback: with `STRIPE_WEBHOOK_SECRET` unset or the webhook
+      disabled, complete checkout → `/api/verify-checkout` should still upgrade
+      the user within ~7 s (Step 3 of the fallback chain)
 
 ## Key design decisions (do not re-litigate without good reason)
 - **One key per user** enforced by `UNIQUE(user_id)` on `api_keys` — not application logic
 - **No dual-auth bridge** on dashboard routes — there are no active users so no
   migration window was needed; API keys are simply rejected at `/api/history` and `/api/proof`
 - **Stripe webhook does NOT materialise a raw key** — it upserts tier, frontend generates key
+- **Frontend never reads `api_keys` directly via Supabase JS client** (post-Wave-3c) —
+  all session state goes through `/api/me`. RLS remains as defense-in-depth, but
+  application correctness does not depend on its configuration.
+- **Checkout completion uses `Status == complete`, not `PaymentStatus == paid`** —
+  for `mode=subscription`, Stripe fires `checkout.session.completed` before the
+  first invoice payment settles, so `PaymentStatus` can be `unpaid` or
+  `no_payment_required` even on a successful checkout.
 - **`log/slog` for all structured logging**, not `log.Printf` — request-scoped logger
   via `httplog.From(r.Context())`, global logger via `slog.Default()`
 - **`sha256.Sum256([]byte(key))` + `hex.EncodeToString`** is the canonical hash —

@@ -122,14 +122,21 @@ export default function App() {
       const urlParams = new URLSearchParams(window.location.search);
       const sessionId = urlParams.get('session_id');
 
-      // Initial read — single query, no polling yet.
-      const { data: keys } = await supabase
-        .from('api_keys')
-        .select('token_hash, subscription_tier')
-        .eq('user_id', user.id);
-      let row = keys && keys.length > 0 ? keys[0] : null;
-      let hasKey = !!(row && row.token_hash);
-      let tier = row ? (row.subscription_tier || 'free') : 'free';
+      // Initial read — go through the backend (`/api/me`) rather than the
+      // Supabase JS client so the read does not depend on RLS policies being
+      // configured correctly in the Supabase dashboard. The backend uses the
+      // direct Postgres connection, which bypasses RLS; tenant isolation is
+      // enforced by deriving user_id from the verified JWT.
+      const readMe = async () => {
+        const resp = await fetch(`${API_BASE_URL}/api/me`, {
+          headers: { "Authorization": `Bearer ${accessToken}` },
+        });
+        if (!resp.ok) return { hasKey: false, tier: 'free' };
+        return await resp.json();
+      };
+      let me = await readMe();
+      let hasKey = !!me.hasKey;
+      let tier = me.tier || 'free';
       let nextSession = { user, accessToken, hasKey, tier };
 
       if (sessionId) {
@@ -157,18 +164,14 @@ export default function App() {
           }
         }
 
-        // Step 2: Short DB poll (3 × 1.5 s = 4.5 s) for the normal case where
-        // the webhook arrives quickly.
-        if (tier !== 'pro') {
+        // Step 2: Short backend poll (3 × 1.5 s = 4.5 s) for the normal case
+        // where the webhook arrives quickly.
+        if (nextSession.tier !== 'pro') {
           for (let attempt = 0; attempt < 3; attempt++) {
             await new Promise(r => setTimeout(r, 1500));
-            const { data: fresh } = await supabase
-              .from('api_keys')
-              .select('token_hash, subscription_tier')
-              .eq('user_id', user.id);
-            const freshRow = fresh && fresh.length > 0 ? fresh[0] : null;
-            if (freshRow && freshRow.subscription_tier === 'pro') {
-              nextSession = { ...nextSession, tier: 'pro', hasKey: !!(freshRow.token_hash) };
+            const fresh = await readMe();
+            if (fresh.tier === 'pro') {
+              nextSession = { ...nextSession, tier: 'pro', hasKey: !!fresh.hasKey };
               break;
             }
           }
@@ -187,15 +190,11 @@ export default function App() {
               const vData = await vResp.json();
               if (vData.tier === 'pro') {
                 // Re-read hasKey so we reflect the upsert the endpoint just ran.
-                const { data: afterVerify } = await supabase
-                  .from('api_keys')
-                  .select('token_hash, subscription_tier')
-                  .eq('user_id', user.id);
-                const avRow = afterVerify && afterVerify.length > 0 ? afterVerify[0] : null;
+                const afterVerify = await readMe();
                 nextSession = {
                   ...nextSession,
                   tier: 'pro',
-                  hasKey: !!(avRow && avRow.token_hash),
+                  hasKey: !!afterVerify.hasKey,
                 };
               }
             }
