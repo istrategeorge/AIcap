@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import { Shield, AlertTriangle, FileText, CheckCircle, Database, Server, RefreshCw, History, Download, DollarSign, Key, LogOut } from 'lucide-react';
 import { createClient } from '@supabase/supabase-js';
 
@@ -45,6 +45,15 @@ export default function App() {
   const [authForm, setAuthForm] = useState({ email: "", password: "", loading: false });
   const [isSignUp, setIsSignUp] = useState(false);
   const [isCheckoutLoading, setIsCheckoutLoading] = useState(false);
+  // True while we're waiting for the Stripe webhook to mark the user Pro.
+  // Initialised from the URL so the processing screen shows immediately on
+  // the checkout-return page load, before auth state fires.
+  const [checkoutProcessing, setCheckoutProcessing] = useState(
+    IS_CLOUD_SAAS && !!new URLSearchParams(window.location.search).get('session_id')
+  );
+  // Prevents concurrent executions of fetchAndSetUserSession — onAuthStateChange
+  // can emit both INITIAL_SESSION and TOKEN_REFRESHED on the same page load.
+  const fetchSessionRef = useRef(false);
 
   // Fetch DB status on load
   const fetchDbStatus = async () => {
@@ -102,61 +111,84 @@ export default function App() {
   // — it derives userID from the token's `sub` claim, so request bodies
   // that claim a different user_id are ignored.
   const fetchAndSetUserSession = async (supabaseSession) => {
-    const user = supabaseSession.user;
-    const accessToken = supabaseSession.access_token;
+    // Guard: onAuthStateChange emits INITIAL_SESSION + TOKEN_REFRESHED on the
+    // same page load; only the first call should run the full checkout flow.
+    if (fetchSessionRef.current) return;
+    fetchSessionRef.current = true;
     try {
+      const user = supabaseSession.user;
+      const accessToken = supabaseSession.access_token;
+
       const urlParams = new URLSearchParams(window.location.search);
       const sessionId = urlParams.get('session_id');
 
-      // When returning from Stripe checkout the webhook can lag a few seconds.
-      // Poll until subscription_tier = 'pro' appears (up to ~7.5 s) so we
-      // don't show the paywall to a user who just paid.
-      let row = null;
-      const maxAttempts = sessionId ? 6 : 1;
-      for (let attempt = 0; attempt < maxAttempts; attempt++) {
-        if (attempt > 0) await new Promise(r => setTimeout(r, 1500));
-        const { data: keys } = await supabase
-          .from('api_keys')
-          .select('token_hash, subscription_tier')
-          .eq('user_id', user.id);
-        row = keys && keys.length > 0 ? keys[0] : null;
-        if (!sessionId || (row && row.subscription_tier === 'pro')) break;
-      }
-
-      const hasKey = !!(row && row.token_hash);
-      const tier = row ? (row.subscription_tier || 'free') : 'free';
-
+      // Initial read — single query, no polling yet.
+      const { data: keys } = await supabase
+        .from('api_keys')
+        .select('token_hash, subscription_tier')
+        .eq('user_id', user.id);
+      let row = keys && keys.length > 0 ? keys[0] : null;
+      let hasKey = !!(row && row.token_hash);
+      let tier = row ? (row.subscription_tier || 'free') : 'free';
       let nextSession = { user, accessToken, hasKey, tier };
 
-      // Post-checkout return path: the webhook has marked the user Pro
-      // (token_hash still NULL), so materialise the key now and reveal it.
-      if (!hasKey && sessionId) {
-        try {
-          const response = await fetch(`${API_BASE_URL}/api/generate-key`, {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              "Authorization": `Bearer ${accessToken}`,
-            },
-          });
-          if (response.ok) {
-            const data = await response.json();
-            setRevealedKey(data.apiKey);
-            nextSession = { ...nextSession, hasKey: true };
-          } else if (response.status === 409) {
-            // Key already materialised by a concurrent request — acknowledge it.
-            nextSession = { ...nextSession, hasKey: true };
+      if (sessionId) {
+        // Step 1: Materialise the key immediately — don't wait for the webhook
+        // to mark Pro first. The generate-key UPSERT preserves whatever tier
+        // the webhook later writes, so calling it before the webhook is safe.
+        if (!hasKey) {
+          try {
+            const response = await fetch(`${API_BASE_URL}/api/generate-key`, {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                "Authorization": `Bearer ${accessToken}`,
+              },
+            });
+            if (response.ok) {
+              const data = await response.json();
+              setRevealedKey(data.apiKey);
+              nextSession = { ...nextSession, hasKey: true };
+            } else if (response.status === 409) {
+              nextSession = { ...nextSession, hasKey: true };
+            }
+          } catch (keyError) {
+            console.error("Failed to materialise API key:", keyError);
           }
-        } catch (keyError) {
-          console.error("Failed to materialise API key:", keyError);
         }
-        window.history.replaceState({}, document.title, "/"); // Clean up the URL
+
+        // Step 2: Poll for the Stripe webhook to update subscription_tier.
+        // The webhook can lag 5–15 s on staging. Poll up to ~15 s (10 × 1.5 s).
+        if (tier !== 'pro') {
+          for (let attempt = 0; attempt < 10; attempt++) {
+            await new Promise(r => setTimeout(r, 1500));
+            const { data: fresh } = await supabase
+              .from('api_keys')
+              .select('token_hash, subscription_tier')
+              .eq('user_id', user.id);
+            const freshRow = fresh && fresh.length > 0 ? fresh[0] : null;
+            if (freshRow && freshRow.subscription_tier === 'pro') {
+              nextSession = {
+                ...nextSession,
+                tier: 'pro',
+                hasKey: !!(freshRow.token_hash),
+              };
+              break;
+            }
+          }
+        }
+
+        window.history.replaceState({}, document.title, "/");
+        setCheckoutProcessing(false);
       }
 
       setSession(nextSession);
       fetchHistoryData(accessToken);
     } catch (error) {
       console.error("Failed to load user session:", error);
+      setCheckoutProcessing(false);
+    } finally {
+      fetchSessionRef.current = false;
     }
   };
 
@@ -515,6 +547,17 @@ ${scanData.complianceStatus === 'Passed' ? '- [x] High-risk dependency constrain
                  <span className="text-xl font-bold font-mono">Terraform</span>
                </div>
             </div>
+          </div>
+        ) : checkoutProcessing ? (
+          /* Checkout processing — waiting for Stripe webhook to confirm Pro tier */
+          <div className="max-w-lg mx-auto mt-16 bg-white p-8 rounded-2xl shadow-sm border border-slate-200 text-center animate-in fade-in zoom-in-95 duration-300">
+            <div className="w-16 h-16 bg-indigo-100 rounded-full flex items-center justify-center mx-auto mb-4">
+              <RefreshCw className="w-8 h-8 text-indigo-600 animate-spin" />
+            </div>
+            <h2 className="text-2xl font-bold text-slate-900 mb-2">Activating your subscription…</h2>
+            <p className="text-slate-500 text-sm">
+              We're confirming your payment and setting up your Pro account. This usually takes a few seconds.
+            </p>
           </div>
         ) : (
           session.tier !== 'pro' ? (
