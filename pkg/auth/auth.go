@@ -14,12 +14,16 @@ package auth
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"errors"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"strings"
+
+	"aicap/pkg/httplog"
 
 	"github.com/golang-jwt/jwt/v5"
 )
@@ -30,7 +34,6 @@ type ctxKey string
 const (
 	ctxUserID    ctxKey = "aicap.userID"
 	ctxUserEmail ctxKey = "aicap.userEmail"
-	ctxAPIKey    ctxKey = "aicap.apiKey"
 	ctxSubTier   ctxKey = "aicap.subscriptionTier"
 )
 
@@ -98,9 +101,13 @@ func RequireSupabaseJWT(next http.HandlerFunc) http.HandlerFunc {
 			next(w, r)
 			return
 		}
+		logger := httplog.From(r.Context())
 		token := bearerToken(r)
 		if token == "" {
-			log.Printf("auth: %s %s rejected — missing bearer token (origin=%q)", r.Method, r.URL.Path, r.Header.Get("Origin"))
+			logger.Info("auth rejected",
+				slog.String("reason", "missing bearer token"),
+				slog.String("origin", r.Header.Get("Origin")),
+			)
 			http.Error(w, "Unauthorized: missing bearer token", http.StatusUnauthorized)
 			return
 		}
@@ -110,11 +117,14 @@ func RequireSupabaseJWT(next http.HandlerFunc) http.HandlerFunc {
 			// token (client error) so the caller isn't misled into thinking
 			// their credentials are wrong when it's actually a config issue.
 			if os.Getenv("SUPABASE_JWT_SECRET") == "" {
-				log.Println("ERROR: SUPABASE_JWT_SECRET is not set — set this env var in your deployment to enable JWT auth")
+				logger.Error("SUPABASE_JWT_SECRET is not set — set this env var in your deployment to enable JWT auth")
 				http.Error(w, "Server configuration error: JWT secret not configured. Contact the service administrator.", http.StatusInternalServerError)
 				return
 			}
-			log.Printf("auth: %s %s rejected — JWT verify failed: %v", r.Method, r.URL.Path, err)
+			logger.Info("auth rejected",
+				slog.String("reason", "jwt verify failed"),
+				slog.Any("error", err),
+			)
 			http.Error(w, "Unauthorized: invalid or expired token", http.StatusUnauthorized)
 			return
 		}
@@ -125,15 +135,32 @@ func RequireSupabaseJWT(next http.HandlerFunc) http.HandlerFunc {
 }
 
 // APIKeyRecord holds the metadata returned from the api_keys lookup.
+//
+// Token intentionally omitted: after Wave 3b we only store the hash
+// at rest, so no code path can hand a raw key back. If a caller needs
+// to echo the key they must read it from the request's Authorization
+// header — it is never loaded from the database.
 type APIKeyRecord struct {
 	UserID           string
-	Token            string
 	SubscriptionTier string
 	ScansThisMonth   int
 }
 
+// HashAPIKey computes the canonical SHA-256 hash used to index an API key in
+// the database. Exposed so handlers that need to write a row (generate-key,
+// rotate-key, the Stripe webhook) can compute the same value LookupAPIKey
+// would query with. Returns 64 lowercase hex chars — matches the column type
+// produced by Postgres' `encode(sha256(...), 'hex')` in migration 00009.
+func HashAPIKey(key string) string {
+	sum := sha256.Sum256([]byte(key))
+	return hex.EncodeToString(sum[:])
+}
+
 // LookupAPIKey verifies an `aicap_pro_sk_*` key exists in the database and
-// returns the associated user_id + subscription metadata.
+// returns the associated user_id + subscription metadata. The caller-supplied
+// `key` is hashed with SHA-256 before the lookup — the plaintext token is
+// never compared against a stored plaintext column (there is no such column
+// after Wave 3b's migration 00009).
 func LookupAPIKey(db *sql.DB, key string) (*APIKeyRecord, error) {
 	if db == nil {
 		return nil, errors.New("database not configured")
@@ -141,10 +168,10 @@ func LookupAPIKey(db *sql.DB, key string) (*APIKeyRecord, error) {
 	if key == "" {
 		return nil, ErrUnauthorized
 	}
-	rec := &APIKeyRecord{Token: key}
+	rec := &APIKeyRecord{}
 	err := db.QueryRow(
 		`SELECT user_id, COALESCE(subscription_tier, 'free'), COALESCE(scans_this_month, 0)
-		 FROM api_keys WHERE token = $1`, key,
+		 FROM api_keys WHERE token_hash = $1`, HashAPIKey(key),
 	).Scan(&rec.UserID, &rec.SubscriptionTier, &rec.ScansThisMonth)
 	if err == sql.ErrNoRows {
 		return nil, ErrUnauthorized
@@ -167,20 +194,30 @@ func RequireAPIKey(db *sql.DB, next http.HandlerFunc) http.HandlerFunc {
 			next(w, r)
 			return
 		}
+		logger := httplog.From(r.Context())
 		token := bearerToken(r)
 		if token == "" {
-			log.Printf("auth: %s %s rejected — missing API key (origin=%q)", r.Method, r.URL.Path, r.Header.Get("Origin"))
+			logger.Info("auth rejected",
+				slog.String("reason", "missing api key"),
+				slog.String("origin", r.Header.Get("Origin")),
+			)
 			http.Error(w, "Unauthorized: missing API key", http.StatusUnauthorized)
 			return
 		}
 		rec, err := LookupAPIKey(db, token)
 		if err != nil {
-			log.Printf("auth: %s %s rejected — API key lookup failed: %v", r.Method, r.URL.Path, err)
+			// err here is either ErrUnauthorized (the common case — wrong key) or
+			// a real DB error. We log the message so the operator can distinguish,
+			// but the client always sees the same 401 so a timing side-channel
+			// can't probe for which keys exist.
+			logger.Info("auth rejected",
+				slog.String("reason", "api key lookup failed"),
+				slog.Any("error", err),
+			)
 			http.Error(w, "Unauthorized: invalid API key", http.StatusUnauthorized)
 			return
 		}
 		ctx := context.WithValue(r.Context(), ctxUserID, rec.UserID)
-		ctx = context.WithValue(ctx, ctxAPIKey, rec.Token)
 		ctx = context.WithValue(ctx, ctxSubTier, rec.SubscriptionTier)
 		next(w, r.WithContext(ctx))
 	}
@@ -197,13 +234,6 @@ func UserID(r *http.Request) string {
 // (populated by RequireSupabaseJWT only). Empty string if unset.
 func UserEmail(r *http.Request) string {
 	v, _ := r.Context().Value(ctxUserEmail).(string)
-	return v
-}
-
-// APIKey returns the API key used for this request (populated by
-// RequireAPIKey only). Empty string if unset.
-func APIKey(r *http.Request) string {
-	v, _ := r.Context().Value(ctxAPIKey).(string)
 	return v
 }
 

@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import { Shield, AlertTriangle, FileText, CheckCircle, Database, Server, RefreshCw, History, Download, DollarSign, Key, LogOut } from 'lucide-react';
 import { createClient } from '@supabase/supabase-js';
 
@@ -30,12 +30,30 @@ export default function App() {
   const [dbConfig, setDbConfig] = useState({ enabled: false, url: "", connected: false });
   const [dbConnecting, setDbConnecting] = useState(false);
   const [dbError, setDbError] = useState("");
-  
+
   // Auth State
+  // `session` after Wave 3b never contains a raw API key — only:
+  //   accessToken: Supabase session JWT (used for every authenticated backend call)
+  //   hasKey:      whether api_keys has a materialised token_hash for this user
+  //   tier:        'free' | 'pro' (drives paywall)
+  // The one-and-only time we know the raw key is inside `revealedKey`, which
+  // is populated by a successful /api/generate-key or /api/rotate-key response
+  // and cleared as soon as the user dismisses the reveal modal.
   const [session, setSession] = useState(null);
+  const [revealedKey, setRevealedKey] = useState("");
+  const [keyBusy, setKeyBusy] = useState(false);
   const [authForm, setAuthForm] = useState({ email: "", password: "", loading: false });
   const [isSignUp, setIsSignUp] = useState(false);
   const [isCheckoutLoading, setIsCheckoutLoading] = useState(false);
+  // True while we're waiting for the Stripe webhook to mark the user Pro.
+  // Initialised from the URL so the processing screen shows immediately on
+  // the checkout-return page load, before auth state fires.
+  const [checkoutProcessing, setCheckoutProcessing] = useState(
+    IS_CLOUD_SAAS && !!new URLSearchParams(window.location.search).get('session_id')
+  );
+  // Prevents concurrent executions of fetchAndSetUserSession — onAuthStateChange
+  // can emit both INITIAL_SESSION and TOKEN_REFRESHED on the same page load.
+  const fetchSessionRef = useRef(false);
 
   // Fetch DB status on load
   const fetchDbStatus = async () => {
@@ -49,10 +67,12 @@ export default function App() {
     }
   };
 
-  // Fetch historical proof drills
-  const fetchHistoryData = async (keyOverride = "") => {
+  // Fetch historical proof drills. Authenticated with the Supabase session
+  // JWT (Wave 3b) — the backend derives user_id from the token's `sub`
+  // claim and scopes the query to the caller's rows only.
+  const fetchHistoryData = async (tokenOverride = "") => {
     try {
-      const token = keyOverride || (session ? session.apiKey : "");
+      const token = tokenOverride || (session ? session.accessToken : "");
       const headers = {};
       if (token) headers["Authorization"] = `Bearer ${token}`;
 
@@ -80,44 +100,176 @@ export default function App() {
     }
   };
 
-  // Fetch and set user session + API Key.
+  // Fetch and set user session.
+  // After Wave 3b we no longer pull the raw token from api_keys — the column
+  // doesn't exist anymore. We only read the subscription tier and whether a
+  // token_hash is materialised; the plaintext key is only ever visible in
+  // the response to /api/generate-key or /api/rotate-key.
+  //
   // `supabaseSession` is the object returned by supabase.auth (contains
-  // access_token). The backend uses that JWT to authenticate /api/generate-key
-  // — it derives userID from the token's `sub` claim, so the body is ignored.
+  // access_token). The backend uses that JWT to authenticate every route
+  // — it derives userID from the token's `sub` claim, so request bodies
+  // that claim a different user_id are ignored.
   const fetchAndSetUserSession = async (supabaseSession) => {
-    const user = supabaseSession.user;
-    const accessToken = supabaseSession.access_token;
+    // Guard: onAuthStateChange emits INITIAL_SESSION + TOKEN_REFRESHED on the
+    // same page load; only the first call should run the full checkout flow.
+    if (fetchSessionRef.current) return;
+    fetchSessionRef.current = true;
     try {
-      let { data: keys } = await supabase.from('api_keys').select('token').eq('user_id', user.id);
-      let apiKey = keys && keys.length > 0 ? keys[0].token : "";
+      const user = supabaseSession.user;
+      const accessToken = supabaseSession.access_token;
 
       const urlParams = new URLSearchParams(window.location.search);
       const sessionId = urlParams.get('session_id');
 
-      // Auto-provision key server-side if they just returned from a successful Stripe checkout
-      if (!apiKey && sessionId) {
-        try {
-          const response = await fetch(`${API_BASE_URL}/api/generate-key`, {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              "Authorization": `Bearer ${accessToken}`,
-            },
-          });
-          if (response.ok) {
-            const data = await response.json();
-            apiKey = data.apiKey;
+      // Initial read — go through the backend (`/api/me`) rather than the
+      // Supabase JS client so the read does not depend on RLS policies being
+      // configured correctly in the Supabase dashboard. The backend uses the
+      // direct Postgres connection, which bypasses RLS; tenant isolation is
+      // enforced by deriving user_id from the verified JWT.
+      const readMe = async () => {
+        const resp = await fetch(`${API_BASE_URL}/api/me`, {
+          headers: { "Authorization": `Bearer ${accessToken}` },
+        });
+        if (!resp.ok) return { hasKey: false, tier: 'free' };
+        return await resp.json();
+      };
+      let me = await readMe();
+      let hasKey = !!me.hasKey;
+      let tier = me.tier || 'free';
+      let nextSession = { user, accessToken, hasKey, tier };
+
+      if (sessionId) {
+        // Step 1: Materialise the key immediately — don't wait for the webhook
+        // to mark Pro first. The generate-key UPSERT preserves whatever tier
+        // the webhook later writes, so calling it before the webhook is safe.
+        if (!hasKey) {
+          try {
+            const response = await fetch(`${API_BASE_URL}/api/generate-key`, {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                "Authorization": `Bearer ${accessToken}`,
+              },
+            });
+            if (response.ok) {
+              const data = await response.json();
+              setRevealedKey(data.apiKey);
+              nextSession = { ...nextSession, hasKey: true };
+            } else if (response.status === 409) {
+              nextSession = { ...nextSession, hasKey: true };
+            }
+          } catch (keyError) {
+            console.error("Failed to materialise API key:", keyError);
           }
-        } catch (keyError) {
-          console.error("Failed to generate API key:", keyError);
         }
-        window.history.replaceState({}, document.title, "/"); // Clean up the URL
+
+        // Step 2: Short backend poll (3 × 1.5 s = 4.5 s) for the normal case
+        // where the webhook arrives quickly.
+        if (nextSession.tier !== 'pro') {
+          for (let attempt = 0; attempt < 3; attempt++) {
+            await new Promise(r => setTimeout(r, 1500));
+            const fresh = await readMe();
+            if (fresh.tier === 'pro') {
+              nextSession = { ...nextSession, tier: 'pro', hasKey: !!fresh.hasKey };
+              break;
+            }
+          }
+        }
+
+        // Step 3: Webhook fallback — if tier is still 'free' after the short
+        // poll, ask the backend to verify payment directly via the Stripe API.
+        // This handles misconfigured or delayed webhooks on staging.
+        if (nextSession.tier !== 'pro') {
+          try {
+            const vResp = await fetch(
+              `${API_BASE_URL}/api/verify-checkout?session_id=${encodeURIComponent(sessionId)}`,
+              { headers: { "Authorization": `Bearer ${accessToken}` } }
+            );
+            if (vResp.ok) {
+              const vData = await vResp.json();
+              if (vData.tier === 'pro') {
+                // Re-read hasKey so we reflect the upsert the endpoint just ran.
+                const afterVerify = await readMe();
+                nextSession = {
+                  ...nextSession,
+                  tier: 'pro',
+                  hasKey: !!afterVerify.hasKey,
+                };
+              }
+            }
+          } catch (verifyError) {
+            console.error("Failed to verify checkout:", verifyError);
+          }
+        }
+
+        window.history.replaceState({}, document.title, "/");
+        setCheckoutProcessing(false);
       }
 
-      setSession({ user, apiKey, accessToken });
-      if (apiKey) fetchHistoryData(apiKey);
+      setSession(nextSession);
+      fetchHistoryData(accessToken);
     } catch (error) {
-      console.error("Failed to load user API key:", error);
+      console.error("Failed to load user session:", error);
+      setCheckoutProcessing(false);
+    } finally {
+      fetchSessionRef.current = false;
+    }
+  };
+
+  // Manually materialise a key (free-tier self-signup path). Surfaces the
+  // raw key via `revealedKey`; the user must copy it before dismissing.
+  const handleGenerateKey = async () => {
+    if (!session) return;
+    setKeyBusy(true);
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/generate-key`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${session.accessToken}`,
+        },
+      });
+      if (response.status === 409) {
+        // Someone already has a key; offer rotate instead.
+        alert("An API key already exists. Use 'Rotate Key' to replace it.");
+        setSession({ ...session, hasKey: true });
+        return;
+      }
+      if (!response.ok) throw new Error(await response.text());
+      const data = await response.json();
+      setRevealedKey(data.apiKey);
+      setSession({ ...session, hasKey: true });
+    } catch (error) {
+      alert(`Failed to generate key: ${error.message}`);
+    } finally {
+      setKeyBusy(false);
+    }
+  };
+
+  // Rotate: revoke the existing key and issue a new one. One-time reveal.
+  const handleRotateKey = async () => {
+    if (!session) return;
+    if (!window.confirm(
+      "Rotating will immediately invalidate your current key. Any CI pipelines using it will start failing until you update the secret. Continue?"
+    )) return;
+    setKeyBusy(true);
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/rotate-key`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${session.accessToken}`,
+        },
+      });
+      if (!response.ok) throw new Error(await response.text());
+      const data = await response.json();
+      setRevealedKey(data.apiKey);
+      setSession({ ...session, hasKey: true });
+    } catch (error) {
+      alert(`Failed to rotate key: ${error.message}`);
+    } finally {
+      setKeyBusy(false);
     }
   };
 
@@ -129,14 +281,11 @@ export default function App() {
     }
 
     if (IS_CLOUD_SAAS) {
-      // Check active session and fetch API key on page load
-      supabase.auth.getSession().then(({ data: { session } }) => {
-        if (session && session.user) {
-          fetchAndSetUserSession(session);
-        }
-      });
-
-      // Listen for auth changes (e.g., logging in, or logging out from another tab)
+      // onAuthStateChange fires INITIAL_SESSION on mount, covering the initial
+      // load. Removing the separate getSession() call eliminates the race where
+      // both fire fetchAndSetUserSession simultaneously on the checkout-return
+      // URL, which caused a 409 from the second /api/generate-key attempt and
+      // left the session in an inconsistent state.
       const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
         if (session && session.user) {
           fetchAndSetUserSession(session);
@@ -152,7 +301,8 @@ export default function App() {
   const fetchHistoricalProof = async (hash) => {
     try {
       const headers = {};
-      if (session && session.apiKey) headers["Authorization"] = `Bearer ${session.apiKey}`;
+      // Wave 3b: dashboard route, authenticated with the Supabase JWT.
+      if (session && session.accessToken) headers["Authorization"] = `Bearer ${session.accessToken}`;
 
       const response = await fetch(`${API_BASE_URL}/api/proof?hash=${hash}`, { headers });
       if (response.ok) {
@@ -167,23 +317,24 @@ export default function App() {
 
   const handleGenerateAnnexIV = async () => {
     setIsGenerating(true);
-    
+
     try {
       if (dbConfig.connected) {
-        const headers = { "Content-Type": "application/json" };
-        if (session && session.apiKey) headers["Authorization"] = `Bearer ${session.apiKey}`;
-
-        // Send current state to the Go backend to store in Supabase
+        // This path fires only in LOCAL developer mode (isCloudSaaS=false)
+        // where the server runs without auth middleware — so no header is
+        // attached. In cloud mode the dashboard never reaches this code
+        // because /api/save-proof is a CI-pipeline endpoint and dbConfig
+        // is gated on the local-only /api/db-config toggle.
         const response = await fetch(`${API_BASE_URL}/api/save-proof`, {
           method: "POST",
-          headers: headers,
+          headers: { "Content-Type": "application/json" },
           body: JSON.stringify(scanData)
         });
-        
+
         if (response.ok) {
           setMarkdownGenerated(true);
           setHistoricalProof(null); // Clear any currently viewed history
-          fetchHistoryData(session ? session.apiKey : ""); // Refresh history table after saving
+          fetchHistoryData(); // Refresh history table after saving
         } else {
           console.error("Failed to save proof drill");
         }
@@ -347,7 +498,20 @@ ${scanData.complianceStatus === 'Passed' ? '- [x] High-risk dependency constrain
 
       {/* CLOUD SAAS VIEW */}
       {IS_CLOUD_SAAS ? (
-        !session ? (
+        checkoutProcessing ? (
+          /* Checkout processing — show immediately on the success redirect,
+             before the Supabase session is even restored, so the user never
+             sees a login-form flash while we wait for Pro tier to confirm. */
+          <div className="max-w-lg mx-auto mt-16 bg-white p-8 rounded-2xl shadow-sm border border-slate-200 text-center animate-in fade-in zoom-in-95 duration-300">
+            <div className="w-16 h-16 bg-indigo-100 rounded-full flex items-center justify-center mx-auto mb-4">
+              <RefreshCw className="w-8 h-8 text-indigo-600 animate-spin" />
+            </div>
+            <h2 className="text-2xl font-bold text-slate-900 mb-2">Activating your subscription…</h2>
+            <p className="text-slate-500 text-sm">
+              We're confirming your payment and setting up your Pro account. This usually takes a few seconds.
+            </p>
+          </div>
+        ) : !session ? (
           /* Public Landing Page & Authentication */
           <div className="max-w-6xl mx-auto mt-8 animate-in fade-in duration-500">
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-12 items-center">
@@ -423,7 +587,7 @@ ${scanData.complianceStatus === 'Passed' ? '- [x] High-risk dependency constrain
             </div>
           </div>
         ) : (
-          !session.apiKey ? (
+          session.tier !== 'pro' ? (
             /* Paywall / Upgrade Screen */
             <div className="max-w-lg mx-auto mt-16 bg-white p-8 rounded-2xl shadow-sm border border-slate-200 text-center animate-in fade-in zoom-in-95 duration-300">
               <div className="w-16 h-16 bg-amber-100 rounded-full flex items-center justify-center mx-auto mb-4">
@@ -467,16 +631,62 @@ ${scanData.complianceStatus === 'Passed' ? '- [x] High-risk dependency constrain
                 </div>
               </div>
               
-              {/* API Key Display Panel */}
-              <div className="bg-indigo-800/50 p-5 rounded-xl border border-indigo-400/30 w-full md:w-auto shrink-0">
+              {/* API Key Panel — one-time reveal model (Wave 3b).
+                 The plaintext key is only ever shown once, immediately after
+                 generation or rotation, and is stored nowhere the browser can
+                 re-read. If the user loses it, they rotate to issue a new one
+                 (which invalidates any key in their CI secrets). */}
+              <div className="bg-indigo-800/50 p-5 rounded-xl border border-indigo-400/30 w-full md:w-auto shrink-0 max-w-sm">
                 <div className="flex items-center gap-2 mb-3 text-indigo-100">
                   <Key className="w-4 h-4" />
-                  <h3 className="text-sm font-bold uppercase tracking-wider">Your Secret API Key</h3>
+                  <h3 className="text-sm font-bold uppercase tracking-wider">API Key</h3>
                 </div>
-                <code className="block bg-slate-900 text-emerald-400 px-4 py-2.5 rounded-lg text-sm select-all font-mono border border-slate-700">
-                  {session.apiKey}
-                </code>
-                <p className="text-indigo-200 text-xs mt-3 max-w-[240px]">Save this key in your GitHub repository secrets. Do not share it publicly.</p>
+                {revealedKey ? (
+                  <div>
+                    <code className="block bg-slate-900 text-emerald-400 px-4 py-2.5 rounded-lg text-xs select-all font-mono border border-emerald-500/40 break-all">
+                      {revealedKey}
+                    </code>
+                    <p className="text-amber-300 text-xs mt-3 font-semibold">
+                      Copy this key now. It will not be shown again.
+                    </p>
+                    <p className="text-indigo-200 text-xs mt-1">
+                      Paste it into your GitHub repository secrets as <code className="font-mono">AICAP_API_KEY</code>.
+                    </p>
+                    <button
+                      onClick={() => setRevealedKey("")}
+                      className="mt-4 w-full bg-emerald-600 text-white text-sm font-bold py-2 rounded-lg hover:bg-emerald-700 transition"
+                    >
+                      I've saved the key
+                    </button>
+                  </div>
+                ) : session.hasKey ? (
+                  <div>
+                    <p className="text-indigo-100 text-xs mb-3">
+                      An API key is active. The raw value cannot be shown again —
+                      if you lost it, rotate to issue a new one.
+                    </p>
+                    <button
+                      onClick={handleRotateKey}
+                      disabled={keyBusy}
+                      className="w-full bg-slate-900/60 text-white text-sm font-bold py-2 rounded-lg hover:bg-slate-900 transition disabled:opacity-50 border border-indigo-400/30"
+                    >
+                      {keyBusy ? 'Rotating…' : 'Rotate Key'}
+                    </button>
+                  </div>
+                ) : (
+                  <div>
+                    <p className="text-indigo-100 text-xs mb-3">
+                      Generate your API key to use the AIcap GitHub Action.
+                    </p>
+                    <button
+                      onClick={handleGenerateKey}
+                      disabled={keyBusy}
+                      className="w-full bg-emerald-600 text-white text-sm font-bold py-2 rounded-lg hover:bg-emerald-700 transition disabled:opacity-50"
+                    >
+                      {keyBusy ? 'Generating…' : 'Generate API Key'}
+                    </button>
+                  </div>
+                )}
               </div>
             </div>
 

@@ -6,15 +6,15 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
-	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"strings"
 
 	"aicap/pkg/auth"
 	"aicap/pkg/compliance"
+	"aicap/pkg/httplog"
 	"aicap/pkg/scanner"
 	"aicap/pkg/types"
 
@@ -148,26 +148,33 @@ func RegisterRoutes(mux *http.ServeMux, db *sql.DB, isCloudSaaS bool) {
 		}
 
 		userID := auth.UserID(r)
-		apiKey := auth.APIKey(r)
 		tier := auth.SubscriptionTier(r)
 
-		// Re-read scans_this_month inside the handler so the rate-limit check
-		// and increment are as close to atomic as we can get without a tx.
-		var scansUsed int
-		if err := db.QueryRow(
-			"SELECT COALESCE(scans_this_month, 0) FROM api_keys WHERE token = $1", apiKey,
-		).Scan(&scansUsed); err != nil {
-			http.Error(w, "Unauthorized: invalid API key", http.StatusUnauthorized)
-			return
-		}
-		if tier == "free" && scansUsed >= 10 {
-			http.Error(w, "Payment Required: Free tier limit of 10 cloud syncs reached. Please upgrade to Pro.", http.StatusPaymentRequired)
-			return
-		}
-		if _, err := db.Exec(
-			"UPDATE api_keys SET scans_this_month = scans_this_month + 1 WHERE token = $1", apiKey,
-		); err != nil {
-			log.Printf("Failed to increment usage tracking for API Key: %v", err)
+		// Rate-limit check: rolling 30-day count of the caller's own proof
+		// drills. This supersedes the old `api_keys.scans_this_month` counter,
+		// which required a monthly reset job we never shipped — so free-tier
+		// users hit a permanent ceiling after their first 10 scans.
+		//
+		// Counting rows is O(log n) per lookup thanks to the composite index
+		// on (user_id, created_at) added by migration 00006. No counter means
+		// no reset job, no writer contention on UPDATE, and no race where a
+		// scan is recorded but the counter increment fails.
+		if tier == "free" {
+			var recent int
+			if err := db.QueryRow(
+				`SELECT COUNT(*) FROM proof_drills
+				 WHERE user_id = $1 AND created_at > NOW() - INTERVAL '30 days'`,
+				userID,
+			).Scan(&recent); err != nil {
+				httplog.From(r.Context()).Error("rate-limit check failed",
+					slog.String("user_id", userID), slog.Any("error", err))
+				http.Error(w, "Internal server error", http.StatusInternalServerError)
+				return
+			}
+			if recent >= 10 {
+				http.Error(w, "Payment Required: Free tier limit of 10 cloud syncs per 30 days reached. Please upgrade to Pro.", http.StatusPaymentRequired)
+				return
+			}
 		}
 
 		var bom types.AIBOM
@@ -180,7 +187,8 @@ func RegisterRoutes(mux *http.ServeMux, db *sql.DB, isCloudSaaS bool) {
 			ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
 			RETURNING id`, bom.ProjectName).Scan(&projectID)
 		if err != nil {
-			http.Error(w, "Database error: "+err.Error(), http.StatusInternalServerError)
+			httplog.From(r.Context()).Error("upsert project failed", slog.Any("error", err))
+			http.Error(w, "Internal server error", http.StatusInternalServerError)
 			return
 		}
 
@@ -206,7 +214,8 @@ func RegisterRoutes(mux *http.ServeMux, db *sql.DB, isCloudSaaS bool) {
 			projectID, nullableUserID, commitSha, bomJSON, annexIVMarkdown, cryptoHash,
 		)
 		if err != nil {
-			http.Error(w, "Database error: "+err.Error(), http.StatusInternalServerError)
+			httplog.From(r.Context()).Error("insert proof_drill failed", slog.Any("error", err))
+			http.Error(w, "Internal server error", http.StatusInternalServerError)
 			return
 		}
 
@@ -220,9 +229,12 @@ func RegisterRoutes(mux *http.ServeMux, db *sql.DB, isCloudSaaS bool) {
 	}
 
 	// --- History ------------------------------------------------------------
-	// /api/history returns the caller's most recent proof drills. Requires an
-	// API key in cloud mode so we can scope results to their user_id and never
-	// leak another tenant's ledger.
+	// /api/history returns the caller's most recent proof drills. In cloud
+	// mode the route is gated by the user's Supabase session JWT — not their
+	// API key — because this is a dashboard read and the browser already has
+	// a JWT from supabase-js. API keys are for machines (the CI scanner);
+	// forcing the browser to send one would mean storing the raw key in
+	// localStorage, which is exactly the exposure Wave 3b closed.
 	historyHandler := func(w http.ResponseWriter, r *http.Request) {
 		cors(w, r)
 		// Advertise the methods + headers the browser will actually use so the
@@ -243,16 +255,14 @@ func RegisterRoutes(mux *http.ServeMux, db *sql.DB, isCloudSaaS bool) {
 		var err error
 		if isCloudSaaS {
 			userID := auth.UserID(r)
-			// Include rows where user_id IS NULL as a migration bridge:
-			// scans saved by the CLI before Wave 1 was deployed land with
-			// user_id = NULL. Once a user runs a fresh scan those rows get
-			// proper attribution; the NULL clause ensures the old ones stay
-			// visible in the meantime rather than silently disappearing.
+			// Strict tenant scope: the Wave 1 `OR user_id IS NULL` bridge is
+			// gone, and migration 00008 makes user_id NOT NULL in the DB so
+			// the predicate is exhaustive.
 			rows, err = db.Query(`
 				SELECT p.name, pd.commit_sha, pd.crypto_hash, pd.created_at
 				FROM proof_drills pd
 				JOIN projects p ON pd.project_id = p.id
-				WHERE pd.user_id = $1 OR pd.user_id IS NULL
+				WHERE pd.user_id = $1
 				ORDER BY pd.created_at DESC
 				LIMIT 25`, userID)
 		} else {
@@ -264,7 +274,8 @@ func RegisterRoutes(mux *http.ServeMux, db *sql.DB, isCloudSaaS bool) {
 				LIMIT 25`)
 		}
 		if err != nil {
-			http.Error(w, "Database error: "+err.Error(), http.StatusInternalServerError)
+			httplog.From(r.Context()).Error("history query failed", slog.Any("error", err))
+			http.Error(w, "Internal server error", http.StatusInternalServerError)
 			return
 		}
 		defer rows.Close()
@@ -278,14 +289,17 @@ func RegisterRoutes(mux *http.ServeMux, db *sql.DB, isCloudSaaS bool) {
 		json.NewEncoder(w).Encode(records)
 	}
 	if isCloudSaaS {
-		mux.HandleFunc("/api/history", withCORS(auth.RequireAPIKey(db, historyHandler)))
+		mux.HandleFunc("/api/history", withCORS(auth.RequireSupabaseJWT(historyHandler)))
 	} else {
 		mux.HandleFunc("/api/history", historyHandler)
 	}
 
 	// --- Single proof -------------------------------------------------------
-	// /api/proof returns the Annex IV markdown for a given hash. Scoped to the
-	// caller's user_id in cloud mode so hash guessing can't cross tenants.
+	// /api/proof returns the Annex IV markdown for a given hash. Dashboard-
+	// only read, gated by the Supabase session JWT (same rationale as
+	// /api/history — browsers shouldn't carry API keys). Scoped strictly to
+	// the caller's user_id so someone who guesses a crypto_hash they did not
+	// produce cannot fetch another tenant's Annex IV.
 	proofHandler := func(w http.ResponseWriter, r *http.Request) {
 		cors(w, r)
 		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
@@ -308,10 +322,9 @@ func RegisterRoutes(mux *http.ServeMux, db *sql.DB, isCloudSaaS bool) {
 		var err error
 		if isCloudSaaS {
 			userID := auth.UserID(r)
-			// Same bridge as /api/history: allow fetching NULL-user_id rows
-			// that predate the Wave 1 attribution rollout.
+			// Exhaustive user_id predicate after Wave 3b: no more NULL bridge.
 			err = db.QueryRow(
-				"SELECT annex_iv_markdown FROM proof_drills WHERE crypto_hash = $1 AND (user_id = $2 OR user_id IS NULL)",
+				"SELECT annex_iv_markdown FROM proof_drills WHERE crypto_hash = $1 AND user_id = $2",
 				hash, userID,
 			).Scan(&markdown)
 		} else {
@@ -324,13 +337,14 @@ func RegisterRoutes(mux *http.ServeMux, db *sql.DB, isCloudSaaS bool) {
 			return
 		}
 		if err != nil {
-			http.Error(w, "Database error: "+err.Error(), http.StatusInternalServerError)
+			httplog.From(r.Context()).Error("proof query failed", slog.Any("error", err))
+			http.Error(w, "Internal server error", http.StatusInternalServerError)
 			return
 		}
 		json.NewEncoder(w).Encode(map[string]string{"markdown": markdown})
 	}
 	if isCloudSaaS {
-		mux.HandleFunc("/api/proof", withCORS(auth.RequireAPIKey(db, proofHandler)))
+		mux.HandleFunc("/api/proof", withCORS(auth.RequireSupabaseJWT(proofHandler)))
 	} else {
 		mux.HandleFunc("/api/proof", proofHandler)
 	}
@@ -360,7 +374,7 @@ func RegisterRoutes(mux *http.ServeMux, db *sql.DB, isCloudSaaS bool) {
 
 		stripe.Key = os.Getenv("STRIPE_SECRET_KEY")
 		if stripe.Key == "" {
-			log.Println("STRIPE_SECRET_KEY is not set.")
+			httplog.From(r.Context()).Error("STRIPE_SECRET_KEY not set")
 			http.Error(w, "Stripe secret key not configured", http.StatusInternalServerError)
 			return
 		}
@@ -390,8 +404,11 @@ func RegisterRoutes(mux *http.ServeMux, db *sql.DB, isCloudSaaS bool) {
 		}
 		checkoutSession, err := session.New(params)
 		if err != nil {
-			log.Printf("Error creating checkout session: %v", err)
-			http.Error(w, fmt.Sprintf("Stripe Error: %v", err), http.StatusInternalServerError)
+			httplog.From(r.Context()).Error("creating Stripe checkout session", slog.Any("error", err))
+			// Do not leak the raw Stripe error to the browser — it can include
+			// internal IDs / customer hints. A generic message is enough for
+			// the client; ops has the request_id to correlate to the log line.
+			http.Error(w, "Unable to create checkout session. Please try again.", http.StatusBadGateway)
 			return
 		}
 		json.NewEncoder(w).Encode(map[string]string{"sessionId": checkoutSession.ID, "url": checkoutSession.URL})
@@ -414,16 +431,52 @@ func RegisterRoutes(mux *http.ServeMux, db *sql.DB, isCloudSaaS bool) {
 
 		const MaxBodyBytes = int64(65536)
 		r.Body = http.MaxBytesReader(w, r.Body, MaxBodyBytes)
+		logger := httplog.From(r.Context())
 		payload, err := io.ReadAll(r.Body)
 		if err != nil {
-			http.Error(w, fmt.Sprintf("Error reading request body: %v", err), http.StatusServiceUnavailable)
+			logger.Error("read webhook body", slog.Any("error", err))
+			http.Error(w, "Unable to read request body", http.StatusServiceUnavailable)
 			return
 		}
 		endpointSecret := os.Getenv("STRIPE_WEBHOOK_SECRET")
 		event, err := webhook.ConstructEvent(payload, r.Header.Get("stripe-signature"), endpointSecret)
 		if err != nil {
-			log.Printf("Error verifying webhook signature: %v", err)
+			logger.Error("verify webhook signature", slog.Any("error", err))
 			http.Error(w, "Webhook signature verification failed", http.StatusBadRequest)
+			return
+		}
+		// Add event-scoped fields to every log line for the rest of this
+		// request — makes it easy to pivot the log stream by stripe event.
+		logger = logger.With(slog.String("stripe_event_id", event.ID), slog.String("stripe_event_type", string(event.Type)))
+
+		// Idempotency guard. Stripe delivers each event at least once; a
+		// network blip on our 200 response triggers a retry 5 minutes later.
+		// We INSERT the event id up front — the PRIMARY KEY makes a second
+		// attempt fail with a unique-violation, at which point we return 200
+		// immediately without running the side effects a second time.
+		//
+		// Side effects (INSERT api_keys, UPDATE tier, DELETE api_keys) are
+		// not wrapped in the same transaction as the idempotency INSERT.
+		// The chosen trade-off: if we crash between "recorded the event" and
+		// "ran the side effect" we lose that event's effect. That is
+		// strictly safer than the inverse (running the side effect twice),
+		// and Stripe's dashboard lets an operator re-send any event by hand
+		// if we need recovery. Doing both in one tx would require moving the
+		// INSERT to the end, which reopens the double-apply window.
+		if _, err := db.Exec(
+			`INSERT INTO stripe_events (event_id, event_type) VALUES ($1, $2)`,
+			event.ID, event.Type,
+		); err != nil {
+			// pq encodes unique violations as SQLSTATE 23505. Any other
+			// error is a real DB problem and deserves a 500 so Stripe
+			// retries later rather than silently dropping the event.
+			if strings.Contains(err.Error(), "duplicate key") || strings.Contains(err.Error(), "23505") {
+				logger.Info("duplicate webhook event — ignoring replay")
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			logger.Error("record webhook event", slog.Any("error", err))
+			http.Error(w, "internal error", http.StatusInternalServerError)
 			return
 		}
 
@@ -431,94 +484,109 @@ func RegisterRoutes(mux *http.ServeMux, db *sql.DB, isCloudSaaS bool) {
 		case "checkout.session.completed":
 			var cs stripe.CheckoutSession
 			if err := json.Unmarshal(event.Data.Raw, &cs); err != nil {
-				log.Printf("Error parsing webhook JSON: %v", err)
+				logger.Error("parse checkout event", slog.Any("error", err))
 				http.Error(w, "Error parsing webhook JSON", http.StatusBadRequest)
 				return
 			}
 			userID := cs.Metadata["user_id"]
-			customerID := customerID(cs.Customer)
-			log.Printf("Checkout completed: customer=%s userID=%s", customerID, userID)
+			cid := customerID(cs.Customer)
+			logger.Info("checkout completed", slog.String("stripe_customer_id", cid), slog.String("user_id", userID))
 			if userID == "" {
-				log.Printf("checkout.session.completed missing user_id metadata — skipping provision")
+				logger.Warn("checkout.session.completed missing user_id metadata — skipping provision")
 				break
 			}
 
-			var existingKey string
-			err := db.QueryRow("SELECT token FROM api_keys WHERE user_id = $1", userID).Scan(&existingKey)
-			if err != nil {
-				keyBytes := make([]byte, 24)
-				if _, keyErr := rand.Read(keyBytes); keyErr == nil {
-					apiKey := "aicap_pro_sk_" + hex.EncodeToString(keyBytes)
-					if _, insertErr := db.Exec(
-						"INSERT INTO api_keys (user_id, token, stripe_customer_id, subscription_tier) VALUES ($1, $2, $3, 'pro')",
-						userID, apiKey, customerID,
-					); insertErr != nil {
-						log.Printf("Failed to provision API key for user %s: %v", userID, insertErr)
-					} else {
-						log.Printf("API key provisioned (Pro Tier) for user %s", userID)
-					}
-				}
+			// Wave 3b: the webhook no longer materialises a raw API key —
+			// the user never sees it if we do, because this runs server-side.
+			// Instead we upsert a row recording "Pro tier active" with a NULL
+			// token_hash; when the browser lands back on the success page it
+			// calls /api/generate-key, which UPDATEs the existing row with
+			// a fresh hash and returns the plaintext ONCE.
+			//
+			// ON CONFLICT (user_id) relies on the UNIQUE(user_id) constraint
+			// added in migration 00009. We only clobber the subscription
+			// fields — never touch token_hash here, so a user who already
+			// has a materialised key keeps it through a re-subscribe.
+			if _, err := db.Exec(
+				`INSERT INTO api_keys (user_id, stripe_customer_id, subscription_tier)
+				 VALUES ($1, $2, 'pro')
+				 ON CONFLICT (user_id) DO UPDATE
+				 SET stripe_customer_id = EXCLUDED.stripe_customer_id,
+				     subscription_tier  = 'pro'`,
+				userID, cid,
+			); err != nil {
+				logger.Error("mark user pro", slog.String("user_id", userID), slog.Any("error", err))
 			} else {
-				log.Printf("User %s already has an API key, upgrading to Pro", userID)
-				if _, updateErr := db.Exec(
-					"UPDATE api_keys SET subscription_tier = 'pro', stripe_customer_id = $1 WHERE user_id = $2",
-					customerID, userID,
-				); updateErr != nil {
-					log.Printf("Failed to upgrade API key to Pro for user %s: %v", userID, updateErr)
-				}
+				logger.Info("user marked Pro (awaiting key materialisation)", slog.String("user_id", userID))
 			}
 
 		case "customer.subscription.deleted":
 			var sub stripe.Subscription
 			if err := json.Unmarshal(event.Data.Raw, &sub); err != nil {
-				log.Printf("Error parsing subscription deleted event: %v", err)
+				logger.Error("parse subscription deleted event", slog.Any("error", err))
 				break
 			}
 			cid := customerID(sub.Customer)
 			if cid == "" {
 				break
 			}
-			log.Printf("Subscription deleted for customer: %s", cid)
+			logger.Info("subscription deleted", slog.String("stripe_customer_id", cid))
 			result, err := db.Exec("DELETE FROM api_keys WHERE stripe_customer_id = $1", cid)
 			if err != nil {
-				log.Printf("Failed to revoke API key for customer %s: %v", cid, err)
+				logger.Error("revoke API key", slog.String("stripe_customer_id", cid), slog.Any("error", err))
 			} else {
 				rows, _ := result.RowsAffected()
-				log.Printf("Revoked %d API key(s) for customer %s", rows, cid)
+				logger.Info("API keys revoked", slog.String("stripe_customer_id", cid), slog.Int64("count", rows))
 			}
 
 		case "invoice.payment_failed":
 			var invoice stripe.Invoice
 			if err := json.Unmarshal(event.Data.Raw, &invoice); err != nil {
-				log.Printf("Error parsing invoice event: %v", err)
+				logger.Error("parse invoice event", slog.Any("error", err))
 				break
 			}
 			cid := customerID(invoice.Customer)
-			log.Printf("Payment failed: customer=%s invoice=%s attempt=%d",
-				cid, invoice.ID, invoice.AttemptCount)
+			logger.Warn("payment failed",
+				slog.String("stripe_customer_id", cid),
+				slog.String("invoice_id", invoice.ID),
+				slog.Int64("attempt", invoice.AttemptCount))
 			if cid != "" && invoice.AttemptCount >= 3 {
-				log.Printf("Max retry attempts reached for customer %s. Revoking API key.", cid)
+				logger.Warn("max retry attempts reached — revoking API key", slog.String("stripe_customer_id", cid))
 				db.Exec("DELETE FROM api_keys WHERE stripe_customer_id = $1", cid)
 			}
 
 		case "customer.subscription.updated":
 			var sub stripe.Subscription
 			if err := json.Unmarshal(event.Data.Raw, &sub); err != nil {
-				log.Printf("Error parsing subscription update event: %v", err)
+				logger.Error("parse subscription update event", slog.Any("error", err))
 				break
 			}
-			log.Printf("Subscription updated: customer=%s status=%s", customerID(sub.Customer), sub.Status)
+			logger.Info("subscription updated",
+				slog.String("stripe_customer_id", customerID(sub.Customer)),
+				slog.String("status", string(sub.Status)))
 
 		default:
-			log.Printf("Unhandled event type: %s", event.Type)
+			logger.Info("unhandled event type")
 		}
 
 		w.WriteHeader(http.StatusOK)
 	})
 
 	// --- API key issuance ---------------------------------------------------
-	// /api/generate-key returns (or creates) the authenticated user's API key.
-	// userID comes from the verified JWT, never from the request body.
+	// /api/generate-key implements the one-time-reveal model Wave 3b picked
+	// (GitHub / Stripe / AWS style). Called by the dashboard after a fresh
+	// user either signs up for free tier or lands back from Stripe checkout.
+	//
+	// Contract:
+	//   * 201 Created with {"apiKey": "<raw>"} when a brand-new key is
+	//     materialised. This is the ONLY moment the raw key leaves the
+	//     server — subsequent calls cannot re-read it because we only store
+	//     its SHA-256 hash.
+	//   * 409 Conflict when the user already has a materialised key. Client
+	//     is expected to offer "Rotate" (which revokes + reissues) rather
+	//     than silently re-displaying a key we no longer possess in plaintext.
+	//
+	// userID always comes from the verified JWT, never the request body.
 	generateKeyHandler := func(w http.ResponseWriter, r *http.Request) {
 		cors(w, r)
 		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
@@ -536,32 +604,275 @@ func RegisterRoutes(mux *http.ServeMux, db *sql.DB, isCloudSaaS bool) {
 		}
 
 		userID := auth.UserID(r)
+		logger := httplog.From(r.Context()).With(slog.String("user_id", userID))
 
-		var existingKey string
-		err := db.QueryRow("SELECT token FROM api_keys WHERE user_id = $1", userID).Scan(&existingKey)
-		if err == nil {
-			json.NewEncoder(w).Encode(map[string]string{"apiKey": existingKey})
+		// Three possible states for api_keys.user_id = $1:
+		//   1. No row           → INSERT fresh (free-tier signup path)
+		//   2. Row with NULL hash → UPDATE hash (post-checkout webhook left
+		//                          a Pro marker; this materialises the key)
+		//   3. Row with non-NULL hash → 409 (already materialised; must rotate)
+		var existingHash sql.NullString
+		err := db.QueryRow(
+			`SELECT token_hash FROM api_keys WHERE user_id = $1`, userID,
+		).Scan(&existingHash)
+		if err != nil && err != sql.ErrNoRows {
+			logger.Error("lookup existing api key", slog.Any("error", err))
+			http.Error(w, "Internal server error", http.StatusInternalServerError)
+			return
+		}
+		if err == nil && existingHash.Valid && existingHash.String != "" {
+			// Case 3. The raw key is unrecoverable; force the client down the
+			// rotate path instead of silently re-issuing.
+			logger.Info("generate-key rejected: key already materialised")
+			http.Error(w, "API key already exists; rotate it to issue a new one", http.StatusConflict)
 			return
 		}
 
-		keyBytes := make([]byte, 24)
-		if _, err := rand.Read(keyBytes); err != nil {
-			http.Error(w, "Failed to generate key", http.StatusInternalServerError)
+		rawKey, hashed, err := newAPIKey()
+		if err != nil {
+			logger.Error("generate api key bytes", slog.Any("error", err))
+			http.Error(w, "Internal server error", http.StatusInternalServerError)
 			return
 		}
-		apiKey := "aicap_pro_sk_" + hex.EncodeToString(keyBytes)
 
+		// Case 1 vs 2 handled by a single UPSERT. If the webhook pre-created
+		// a Pro marker (NULL hash), we fill it in and preserve the 'pro'
+		// tier; if there's no row at all, the INSERT path creates a 'free'
+		// key for a user who is generating before paying.
 		if _, err := db.Exec(
-			"INSERT INTO api_keys (user_id, token) VALUES ($1, $2)", userID, apiKey,
+			`INSERT INTO api_keys (user_id, token_hash, subscription_tier)
+			 VALUES ($1, $2, 'free')
+			 ON CONFLICT (user_id) DO UPDATE
+			 SET token_hash = EXCLUDED.token_hash`,
+			userID, hashed,
 		); err != nil {
-			http.Error(w, "Failed to store key: "+err.Error(), http.StatusInternalServerError)
+			logger.Error("store api key", slog.Any("error", err))
+			http.Error(w, "Internal server error", http.StatusInternalServerError)
 			return
 		}
 
+		logger.Info("api key materialised")
 		w.WriteHeader(http.StatusCreated)
-		json.NewEncoder(w).Encode(map[string]string{"apiKey": apiKey})
+		json.NewEncoder(w).Encode(map[string]string{"apiKey": rawKey})
 	}
 	mux.HandleFunc("/api/generate-key", withCORS(auth.RequireSupabaseJWT(generateKeyHandler)))
+
+	// --- API key rotation ---------------------------------------------------
+	// /api/rotate-key revokes the caller's current key and issues a fresh
+	// one. Same one-time-reveal contract as /api/generate-key — the new
+	// plaintext is only in this response body, never retrievable later.
+	//
+	// Idempotency: calling rotate when no row exists behaves identically
+	// to generate-key (creates a free-tier row). The existing tier is
+	// preserved on rotate so a Pro user doesn't accidentally downgrade.
+	rotateKeyHandler := func(w http.ResponseWriter, r *http.Request) {
+		cors(w, r)
+		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		if r.Method == "OPTIONS" {
+			return
+		}
+		if r.Method != "POST" {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if !isCloudSaaS || db == nil {
+			http.Error(w, "SaaS features require cloud deployment", http.StatusInternalServerError)
+			return
+		}
+
+		userID := auth.UserID(r)
+		logger := httplog.From(r.Context()).With(slog.String("user_id", userID))
+
+		rawKey, hashed, err := newAPIKey()
+		if err != nil {
+			logger.Error("generate api key bytes", slog.Any("error", err))
+			http.Error(w, "Internal server error", http.StatusInternalServerError)
+			return
+		}
+
+		// UPSERT rather than UPDATE so a user who never materialised a key
+		// before calling rotate still gets one. Tier is left untouched on
+		// the conflict path so a Pro user stays Pro.
+		if _, err := db.Exec(
+			`INSERT INTO api_keys (user_id, token_hash, subscription_tier)
+			 VALUES ($1, $2, 'free')
+			 ON CONFLICT (user_id) DO UPDATE
+			 SET token_hash = EXCLUDED.token_hash`,
+			userID, hashed,
+		); err != nil {
+			logger.Error("rotate api key", slog.Any("error", err))
+			http.Error(w, "Internal server error", http.StatusInternalServerError)
+			return
+		}
+
+		logger.Info("api key rotated")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{"apiKey": rawKey})
+	}
+	mux.HandleFunc("/api/rotate-key", withCORS(auth.RequireSupabaseJWT(rotateKeyHandler)))
+
+	// --- Checkout verification (webhook fallback) ----------------------------
+	// /api/verify-checkout is called by the frontend on the checkout-return
+	// page when the Stripe webhook hasn't updated the tier within a few
+	// seconds. It fetches the Checkout Session directly from the Stripe API,
+	// confirms payment_status == "paid", and writes Pro tier to the DB.
+	//
+	// This makes checkout reliable even when the webhook is mis-configured,
+	// delayed, or simply hasn't been set up yet on a staging environment.
+	// The upsert is idempotent so calling this after the webhook has already
+	// run is harmless.
+	verifyCheckoutHandler := func(w http.ResponseWriter, r *http.Request) {
+		cors(w, r)
+		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		if r.Method == "OPTIONS" {
+			return
+		}
+		if r.Method != "GET" {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if !isCloudSaaS || db == nil {
+			http.Error(w, "SaaS features require cloud deployment", http.StatusInternalServerError)
+			return
+		}
+
+		userID := auth.UserID(r)
+		logger := httplog.From(r.Context()).With(slog.String("user_id", userID))
+
+		sessionID := r.URL.Query().Get("session_id")
+		if sessionID == "" {
+			http.Error(w, "Missing session_id parameter", http.StatusBadRequest)
+			return
+		}
+
+		stripe.Key = os.Getenv("STRIPE_SECRET_KEY")
+		if stripe.Key == "" {
+			logger.Error("STRIPE_SECRET_KEY not set")
+			http.Error(w, "Stripe not configured", http.StatusInternalServerError)
+			return
+		}
+
+		cs, err := session.Get(sessionID, nil)
+		if err != nil {
+			logger.Error("retrieve checkout session from Stripe", slog.Any("error", err))
+			http.Error(w, "Unable to verify checkout session", http.StatusBadGateway)
+			return
+		}
+
+		// Ensure the session was created for this authenticated user so a
+		// caller can't pass someone else's session_id and steal their tier.
+		if cs.Metadata["user_id"] != userID {
+			logger.Warn("checkout session user_id mismatch",
+				slog.String("session_user_id", cs.Metadata["user_id"]))
+			http.Error(w, "Forbidden", http.StatusForbidden)
+			return
+		}
+
+		// Log both status fields so webhook / verify-checkout discrepancies
+		// are easy to spot in production logs.
+		logger.Info("checkout session retrieved",
+			slog.String("cs_status", string(cs.Status)),
+			slog.String("cs_payment_status", string(cs.PaymentStatus)))
+
+		w.Header().Set("Content-Type", "application/json")
+
+		// Use cs.Status == "complete" rather than PaymentStatus == "paid".
+		// For mode=subscription Stripe fires checkout.session.completed (and
+		// redirects the browser) before the first invoice is confirmed, so
+		// PaymentStatus can still be "unpaid" or "no_payment_required" at
+		// the moment we call session.Get. "complete" is set the instant the
+		// checkout flow finishes — the same signal the webhook uses.
+		if cs.Status != stripe.CheckoutSessionStatusComplete {
+			json.NewEncoder(w).Encode(map[string]string{"tier": "free"})
+			return
+		}
+
+		cid := customerID(cs.Customer)
+		logger.Info("checkout verified via Stripe API",
+			slog.String("stripe_customer_id", cid),
+			slog.String("payment_status", string(cs.PaymentStatus)))
+
+		if _, err := db.Exec(
+			`INSERT INTO api_keys (user_id, stripe_customer_id, subscription_tier)
+			 VALUES ($1, $2, 'pro')
+			 ON CONFLICT (user_id) DO UPDATE
+			 SET stripe_customer_id = EXCLUDED.stripe_customer_id,
+			     subscription_tier  = 'pro'`,
+			userID, cid,
+		); err != nil {
+			logger.Error("upgrade user to pro via verify-checkout", slog.Any("error", err))
+			http.Error(w, "Internal server error", http.StatusInternalServerError)
+			return
+		}
+
+		logger.Info("user upgraded to Pro via checkout verification")
+		json.NewEncoder(w).Encode(map[string]string{"tier": "pro"})
+	}
+	mux.HandleFunc("/api/verify-checkout", withCORS(auth.RequireSupabaseJWT(verifyCheckoutHandler)))
+
+	// --- Session/profile read -----------------------------------------------
+	// /api/me returns the caller's subscription tier and whether their API
+	// key has been materialised. The frontend uses this instead of reading
+	// api_keys directly through the Supabase JS client so the read path does
+	// not depend on RLS policies being configured in the Supabase dashboard.
+	// Backend access bypasses RLS via the direct Postgres connection.
+	meHandler := func(w http.ResponseWriter, r *http.Request) {
+		cors(w, r)
+		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		if r.Method == "OPTIONS" {
+			return
+		}
+		if r.Method != "GET" {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if !isCloudSaaS || db == nil {
+			http.Error(w, "SaaS features require cloud deployment", http.StatusInternalServerError)
+			return
+		}
+
+		userID := auth.UserID(r)
+		logger := httplog.From(r.Context()).With(slog.String("user_id", userID))
+
+		var tokenHash sql.NullString
+		var tier sql.NullString
+		err := db.QueryRow(
+			`SELECT token_hash, subscription_tier FROM api_keys WHERE user_id = $1`,
+			userID,
+		).Scan(&tokenHash, &tier)
+		if err != nil && err != sql.ErrNoRows {
+			logger.Error("me lookup", slog.Any("error", err))
+			http.Error(w, "Internal server error", http.StatusInternalServerError)
+			return
+		}
+
+		resolvedTier := "free"
+		if tier.Valid && tier.String != "" {
+			resolvedTier = tier.String
+		}
+		json.NewEncoder(w).Encode(map[string]any{
+			"hasKey": tokenHash.Valid && tokenHash.String != "",
+			"tier":   resolvedTier,
+		})
+	}
+	mux.HandleFunc("/api/me", withCORS(auth.RequireSupabaseJWT(meHandler)))
+}
+
+// newAPIKey generates a fresh aicap_pro_sk_* token and returns both the raw
+// plaintext (to echo to the caller exactly once) and its SHA-256 hash (to
+// persist). Shared by /api/generate-key and /api/rotate-key to keep the
+// token prefix and hash algorithm in one place.
+func newAPIKey() (raw, hashed string, err error) {
+	keyBytes := make([]byte, 24)
+	if _, err = rand.Read(keyBytes); err != nil {
+		return "", "", err
+	}
+	raw = "aicap_pro_sk_" + hex.EncodeToString(keyBytes)
+	hashed = auth.HashAPIKey(raw)
+	return raw, hashed, nil
 }
 
 // parseAllowedOrigins splits a comma-separated VITE_FRONTEND_URL into a set of
