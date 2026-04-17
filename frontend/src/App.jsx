@@ -105,18 +105,26 @@ export default function App() {
     const user = supabaseSession.user;
     const accessToken = supabaseSession.access_token;
     try {
-      // RLS on api_keys lets a user read only their own row. We only
-      // need to know "does a token_hash exist?" + tier to drive UI state.
-      let { data: keys } = await supabase
-        .from('api_keys')
-        .select('token_hash, subscription_tier')
-        .eq('user_id', user.id);
-      const row = keys && keys.length > 0 ? keys[0] : null;
-      const hasKey = !!(row && row.token_hash);
-      const tier = row ? (row.subscription_tier || 'free') : 'free';
-
       const urlParams = new URLSearchParams(window.location.search);
       const sessionId = urlParams.get('session_id');
+
+      // When returning from Stripe checkout the webhook can lag a few seconds.
+      // Poll until subscription_tier = 'pro' appears (up to ~7.5 s) so we
+      // don't show the paywall to a user who just paid.
+      let row = null;
+      const maxAttempts = sessionId ? 6 : 1;
+      for (let attempt = 0; attempt < maxAttempts; attempt++) {
+        if (attempt > 0) await new Promise(r => setTimeout(r, 1500));
+        const { data: keys } = await supabase
+          .from('api_keys')
+          .select('token_hash, subscription_tier')
+          .eq('user_id', user.id);
+        row = keys && keys.length > 0 ? keys[0] : null;
+        if (!sessionId || (row && row.subscription_tier === 'pro')) break;
+      }
+
+      const hasKey = !!(row && row.token_hash);
+      const tier = row ? (row.subscription_tier || 'free') : 'free';
 
       let nextSession = { user, accessToken, hasKey, tier };
 
@@ -134,6 +142,9 @@ export default function App() {
           if (response.ok) {
             const data = await response.json();
             setRevealedKey(data.apiKey);
+            nextSession = { ...nextSession, hasKey: true };
+          } else if (response.status === 409) {
+            // Key already materialised by a concurrent request — acknowledge it.
             nextSession = { ...nextSession, hasKey: true };
           }
         } catch (keyError) {
@@ -213,14 +224,11 @@ export default function App() {
     }
 
     if (IS_CLOUD_SAAS) {
-      // Check active session and fetch API key on page load
-      supabase.auth.getSession().then(({ data: { session } }) => {
-        if (session && session.user) {
-          fetchAndSetUserSession(session);
-        }
-      });
-
-      // Listen for auth changes (e.g., logging in, or logging out from another tab)
+      // onAuthStateChange fires INITIAL_SESSION on mount, covering the initial
+      // load. Removing the separate getSession() call eliminates the race where
+      // both fire fetchAndSetUserSession simultaneously on the checkout-return
+      // URL, which caused a 409 from the second /api/generate-key attempt and
+      // left the session in an inconsistent state.
       const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
         if (session && session.user) {
           fetchAndSetUserSession(session);
