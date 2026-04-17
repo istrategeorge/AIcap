@@ -157,10 +157,10 @@ export default function App() {
           }
         }
 
-        // Step 2: Poll for the Stripe webhook to update subscription_tier.
-        // The webhook can lag 5–15 s on staging. Poll up to ~15 s (10 × 1.5 s).
+        // Step 2: Short DB poll (3 × 1.5 s = 4.5 s) for the normal case where
+        // the webhook arrives quickly.
         if (tier !== 'pro') {
-          for (let attempt = 0; attempt < 10; attempt++) {
+          for (let attempt = 0; attempt < 3; attempt++) {
             await new Promise(r => setTimeout(r, 1500));
             const { data: fresh } = await supabase
               .from('api_keys')
@@ -168,13 +168,39 @@ export default function App() {
               .eq('user_id', user.id);
             const freshRow = fresh && fresh.length > 0 ? fresh[0] : null;
             if (freshRow && freshRow.subscription_tier === 'pro') {
-              nextSession = {
-                ...nextSession,
-                tier: 'pro',
-                hasKey: !!(freshRow.token_hash),
-              };
+              nextSession = { ...nextSession, tier: 'pro', hasKey: !!(freshRow.token_hash) };
               break;
             }
+          }
+        }
+
+        // Step 3: Webhook fallback — if tier is still 'free' after the short
+        // poll, ask the backend to verify payment directly via the Stripe API.
+        // This handles misconfigured or delayed webhooks on staging.
+        if (nextSession.tier !== 'pro') {
+          try {
+            const vResp = await fetch(
+              `${API_BASE_URL}/api/verify-checkout?session_id=${encodeURIComponent(sessionId)}`,
+              { headers: { "Authorization": `Bearer ${accessToken}` } }
+            );
+            if (vResp.ok) {
+              const vData = await vResp.json();
+              if (vData.tier === 'pro') {
+                // Re-read hasKey so we reflect the upsert the endpoint just ran.
+                const { data: afterVerify } = await supabase
+                  .from('api_keys')
+                  .select('token_hash, subscription_tier')
+                  .eq('user_id', user.id);
+                const avRow = afterVerify && afterVerify.length > 0 ? afterVerify[0] : null;
+                nextSession = {
+                  ...nextSession,
+                  tier: 'pro',
+                  hasKey: !!(avRow && avRow.token_hash),
+                };
+              }
+            }
+          } catch (verifyError) {
+            console.error("Failed to verify checkout:", verifyError);
           }
         }
 
@@ -473,7 +499,20 @@ ${scanData.complianceStatus === 'Passed' ? '- [x] High-risk dependency constrain
 
       {/* CLOUD SAAS VIEW */}
       {IS_CLOUD_SAAS ? (
-        !session ? (
+        checkoutProcessing ? (
+          /* Checkout processing — show immediately on the success redirect,
+             before the Supabase session is even restored, so the user never
+             sees a login-form flash while we wait for Pro tier to confirm. */
+          <div className="max-w-lg mx-auto mt-16 bg-white p-8 rounded-2xl shadow-sm border border-slate-200 text-center animate-in fade-in zoom-in-95 duration-300">
+            <div className="w-16 h-16 bg-indigo-100 rounded-full flex items-center justify-center mx-auto mb-4">
+              <RefreshCw className="w-8 h-8 text-indigo-600 animate-spin" />
+            </div>
+            <h2 className="text-2xl font-bold text-slate-900 mb-2">Activating your subscription…</h2>
+            <p className="text-slate-500 text-sm">
+              We're confirming your payment and setting up your Pro account. This usually takes a few seconds.
+            </p>
+          </div>
+        ) : !session ? (
           /* Public Landing Page & Authentication */
           <div className="max-w-6xl mx-auto mt-8 animate-in fade-in duration-500">
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-12 items-center">
@@ -547,17 +586,6 @@ ${scanData.complianceStatus === 'Passed' ? '- [x] High-risk dependency constrain
                  <span className="text-xl font-bold font-mono">Terraform</span>
                </div>
             </div>
-          </div>
-        ) : checkoutProcessing ? (
-          /* Checkout processing — waiting for Stripe webhook to confirm Pro tier */
-          <div className="max-w-lg mx-auto mt-16 bg-white p-8 rounded-2xl shadow-sm border border-slate-200 text-center animate-in fade-in zoom-in-95 duration-300">
-            <div className="w-16 h-16 bg-indigo-100 rounded-full flex items-center justify-center mx-auto mb-4">
-              <RefreshCw className="w-8 h-8 text-indigo-600 animate-spin" />
-            </div>
-            <h2 className="text-2xl font-bold text-slate-900 mb-2">Activating your subscription…</h2>
-            <p className="text-slate-500 text-sm">
-              We're confirming your payment and setting up your Pro account. This usually takes a few seconds.
-            </p>
           </div>
         ) : (
           session.tier !== 'pro' ? (

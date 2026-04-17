@@ -711,6 +711,94 @@ func RegisterRoutes(mux *http.ServeMux, db *sql.DB, isCloudSaaS bool) {
 		json.NewEncoder(w).Encode(map[string]string{"apiKey": rawKey})
 	}
 	mux.HandleFunc("/api/rotate-key", withCORS(auth.RequireSupabaseJWT(rotateKeyHandler)))
+
+	// --- Checkout verification (webhook fallback) ----------------------------
+	// /api/verify-checkout is called by the frontend on the checkout-return
+	// page when the Stripe webhook hasn't updated the tier within a few
+	// seconds. It fetches the Checkout Session directly from the Stripe API,
+	// confirms payment_status == "paid", and writes Pro tier to the DB.
+	//
+	// This makes checkout reliable even when the webhook is mis-configured,
+	// delayed, or simply hasn't been set up yet on a staging environment.
+	// The upsert is idempotent so calling this after the webhook has already
+	// run is harmless.
+	verifyCheckoutHandler := func(w http.ResponseWriter, r *http.Request) {
+		cors(w, r)
+		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		if r.Method == "OPTIONS" {
+			return
+		}
+		if r.Method != "GET" {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if !isCloudSaaS || db == nil {
+			http.Error(w, "SaaS features require cloud deployment", http.StatusInternalServerError)
+			return
+		}
+
+		userID := auth.UserID(r)
+		logger := httplog.From(r.Context()).With(slog.String("user_id", userID))
+
+		sessionID := r.URL.Query().Get("session_id")
+		if sessionID == "" {
+			http.Error(w, "Missing session_id parameter", http.StatusBadRequest)
+			return
+		}
+
+		stripe.Key = os.Getenv("STRIPE_SECRET_KEY")
+		if stripe.Key == "" {
+			logger.Error("STRIPE_SECRET_KEY not set")
+			http.Error(w, "Stripe not configured", http.StatusInternalServerError)
+			return
+		}
+
+		cs, err := session.Get(sessionID, nil)
+		if err != nil {
+			logger.Error("retrieve checkout session from Stripe", slog.Any("error", err))
+			http.Error(w, "Unable to verify checkout session", http.StatusBadGateway)
+			return
+		}
+
+		// Ensure the session was created for this authenticated user so a
+		// caller can't pass someone else's session_id and steal their tier.
+		if cs.Metadata["user_id"] != userID {
+			logger.Warn("checkout session user_id mismatch",
+				slog.String("session_user_id", cs.Metadata["user_id"]))
+			http.Error(w, "Forbidden", http.StatusForbidden)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+
+		if cs.PaymentStatus != stripe.CheckoutSessionPaymentStatusPaid {
+			json.NewEncoder(w).Encode(map[string]string{"tier": "free"})
+			return
+		}
+
+		cid := customerID(cs.Customer)
+		logger.Info("checkout verified via Stripe API",
+			slog.String("stripe_customer_id", cid),
+			slog.String("payment_status", string(cs.PaymentStatus)))
+
+		if _, err := db.Exec(
+			`INSERT INTO api_keys (user_id, stripe_customer_id, subscription_tier)
+			 VALUES ($1, $2, 'pro')
+			 ON CONFLICT (user_id) DO UPDATE
+			 SET stripe_customer_id = EXCLUDED.stripe_customer_id,
+			     subscription_tier  = 'pro'`,
+			userID, cid,
+		); err != nil {
+			logger.Error("upgrade user to pro via verify-checkout", slog.Any("error", err))
+			http.Error(w, "Internal server error", http.StatusInternalServerError)
+			return
+		}
+
+		logger.Info("user upgraded to Pro via checkout verification")
+		json.NewEncoder(w).Encode(map[string]string{"tier": "pro"})
+	}
+	mux.HandleFunc("/api/verify-checkout", withCORS(auth.RequireSupabaseJWT(verifyCheckoutHandler)))
 }
 
 // newAPIKey generates a fresh aicap_pro_sk_* token and returns both the raw
