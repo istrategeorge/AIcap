@@ -770,9 +770,21 @@ func RegisterRoutes(mux *http.ServeMux, db *sql.DB, isCloudSaaS bool) {
 			return
 		}
 
+		// Log both status fields so webhook / verify-checkout discrepancies
+		// are easy to spot in production logs.
+		logger.Info("checkout session retrieved",
+			slog.String("cs_status", string(cs.Status)),
+			slog.String("cs_payment_status", string(cs.PaymentStatus)))
+
 		w.Header().Set("Content-Type", "application/json")
 
-		if cs.PaymentStatus != stripe.CheckoutSessionPaymentStatusPaid {
+		// Use cs.Status == "complete" rather than PaymentStatus == "paid".
+		// For mode=subscription Stripe fires checkout.session.completed (and
+		// redirects the browser) before the first invoice is confirmed, so
+		// PaymentStatus can still be "unpaid" or "no_payment_required" at
+		// the moment we call session.Get. "complete" is set the instant the
+		// checkout flow finishes — the same signal the webhook uses.
+		if cs.Status != stripe.CheckoutSessionStatusComplete {
 			json.NewEncoder(w).Encode(map[string]string{"tier": "free"})
 			return
 		}
