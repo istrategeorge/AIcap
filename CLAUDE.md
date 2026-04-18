@@ -148,16 +148,24 @@ Commits: `f59e339`, `a2adeac`, `dd5d41f`, `ca9ff46`, `d79d9fd` — all on `devel
   being configured in the Supabase dashboard. RLS stays enabled as
   defense-in-depth (if the anon key leaks, it still blocks cross-tenant reads).
 
-## Pending work (Wave 4)
+### Wave 4 (in progress — on development)
+- **CI integration-test job** — `.github/workflows/go-test.yml` runs `go build`,
+  `go test ./...` (unit) and `go test -tags=integration ./...` (integration,
+  against a Postgres 16 service container) on every push/PR to `main` and
+  `development`. Uses `go-version-file: go.mod` so the toolchain stays in sync
+  with the module declaration instead of pinning a version that drifts.
+- **`/livez` vs `/readyz` split** — `/livez` always returns 200 if the process
+  can serve (for liveness probes: a failing DB must not trigger a pod
+  restart). `/readyz` returns 503 when the DB ping fails so the orchestrator
+  pulls the pod out of the LB. `/healthz` is kept as an alias of `/readyz`
+  so existing Render probes don't break during a rolling probe-URL update.
+
+## Pending work (Wave 4 remainder)
 These items were explicitly deferred and not yet started:
 
-1. **CI integration-test job** — wire `go test -tags=integration` in GitHub Actions
-   using a Postgres service container
-2. **`/readyz` vs `/livez` split** — `/healthz` currently does both; separate into
-   liveness (process alive) and readiness (DB reachable) for Kubernetes/Render
-3. **Merkle-tree ledger anchoring** — tamper-evidence for `proof_drills` rows using
+1. **Merkle-tree ledger anchoring** — tamper-evidence for `proof_drills` rows using
    a hash-chain so a DB admin can't silently edit historical records
-4. **Frontend refresh-token handling** — Supabase JWTs expire; the frontend currently
+2. **Frontend refresh-token handling** — Supabase JWTs expire; the frontend currently
    has no `supabase.auth.onAuthStateChange` recovery path when a JWT expires
    mid-session (user sees silent 401s on dashboard calls)
 

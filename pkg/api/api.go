@@ -56,9 +56,22 @@ func RegisterRoutes(mux *http.ServeMux, db *sql.DB, isCloudSaaS bool) {
 	}
 
 	// --- Health --------------------------------------------------------------
-	// /healthz is used by Render/K8s liveness probes. It reports DB status
-	// without leaking any configuration details.
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+	// Three endpoints, each answering a different question:
+	//
+	//   /livez   — "is the process alive?"       Always 200 if we can serve.
+	//   /readyz  — "can we serve real traffic?"  200 iff dependencies are up.
+	//   /healthz — legacy combined probe, same semantics as /readyz. Kept so
+	//              existing Render/K8s probes don't break during rollout.
+	//
+	// Splitting them matters for orchestrators: a failing /livez causes the pod
+	// to be restarted, while a failing /readyz only pulls it out of the load
+	// balancer. If a transient DB blip were wired into a liveness probe it
+	// would trigger pointless restart loops.
+	livez := func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	}
+	readyz := func(w http.ResponseWriter, r *http.Request) {
 		status := "ok"
 		code := http.StatusOK
 		if isCloudSaaS && (db == nil || db.Ping() != nil) {
@@ -68,7 +81,10 @@ func RegisterRoutes(mux *http.ServeMux, db *sql.DB, isCloudSaaS bool) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(code)
 		json.NewEncoder(w).Encode(map[string]string{"status": status})
-	})
+	}
+	mux.HandleFunc("/livez", livez)
+	mux.HandleFunc("/readyz", readyz)
+	mux.HandleFunc("/healthz", readyz)
 
 	// --- Local scan (dev only) ----------------------------------------------
 	// /api/scan runs a filesystem scan on the server's working directory. That

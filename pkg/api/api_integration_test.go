@@ -114,13 +114,43 @@ func seedAPIKey(t *testing.T, db *sql.DB, userID, tier string) string {
 // suspect (wiring, DB connectivity, migration runner, route registration).
 func TestHealthz_OK(t *testing.T) {
 	srv, _ := setup(t)
-	resp, err := http.Get(srv.URL + "/healthz")
-	if err != nil {
-		t.Fatalf("GET /healthz: %v", err)
+	for _, path := range []string{"/healthz", "/livez", "/readyz"} {
+		resp, err := http.Get(srv.URL + path)
+		if err != nil {
+			t.Fatalf("GET %s: %v", path, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != 200 {
+			t.Errorf("%s status = %d, want 200", path, resp.StatusCode)
+		}
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		t.Errorf("status = %d, want 200", resp.StatusCode)
+}
+
+// TestReadyz_FailsWhenDBDown verifies the orchestrator contract: if the DB
+// is unreachable we return 503 on /readyz (pull out of LB) but /livez still
+// returns 200 (don't restart the pod for a transient DB blip).
+func TestReadyz_FailsWhenDBDown(t *testing.T) {
+	srv, db := setup(t)
+	// Close the underlying DB so Ping fails. The httptest server keeps
+	// serving; only the readiness dependency goes away.
+	db.Close()
+
+	resp, err := http.Get(srv.URL + "/readyz")
+	if err != nil {
+		t.Fatalf("GET /readyz: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("/readyz status = %d, want 503", resp.StatusCode)
+	}
+
+	resp, err = http.Get(srv.URL + "/livez")
+	if err != nil {
+		t.Fatalf("GET /livez: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("/livez status = %d, want 200 (liveness must not depend on DB)", resp.StatusCode)
 	}
 }
 
