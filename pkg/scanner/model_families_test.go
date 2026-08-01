@@ -200,3 +200,52 @@ func TestParsePackageJson_DetectsScopedAIPackages(t *testing.T) {
 		t.Error("express should not be reported — it is not an AI library")
 	}
 }
+
+func TestIsTargetModelLiteral_RejectsPunctuatedFragments(t *testing.T) {
+	// A model identifier is a token. Punctuation means the literal is a
+	// fragment of code or prose that merely contains a model name.
+	//
+	// Found in AIcap's own report: the string "(vgpt-5)" — lifted from a
+	// test assertion in this repo — was detected as a component and
+	// rendered as "Hardcoded Model ((vgpt-5))". The whitespace guard did
+	// not catch it because the fragment has none.
+	fragments := []string{
+		"(vgpt-5)",
+		"(gpt-4)",
+		"model=gpt-4",
+		"gpt-4-%s",
+		`"gpt-4"`,
+		"gpt-4,claude-3",
+		"[gpt-4]",
+		"{gpt-4}",
+		"<gpt-4>",
+		"gpt-4;",
+		"gpt-4|claude-3",
+	}
+	for _, f := range fragments {
+		if isTargetModelLiteral(f) {
+			t.Errorf("isTargetModelLiteral(%q) = true — punctuated fragments are not identifiers", f)
+		}
+	}
+}
+
+func TestIsTargetModelLiteral_KeepsRealIdentifierShapes(t *testing.T) {
+	// The tightening must not cost any legitimate identifier form:
+	// vendor prefixes, date suffixes, file paths, tags.
+	identifiers := []string{
+		"gpt-5",
+		"gpt-4o-2024-08-06",
+		"claude-3-opus-20240229",
+		"anthropic/claude-haiku-4-5",
+		"meta-llama/Meta-Llama-3-8B",
+		"mistralai/Mixtral-8x7B-v0.1",
+		"models/llama-3-8b.gguf",
+		"deepseek-v3.1",
+		"o3-mini",
+	}
+	for _, id := range identifiers {
+		if !isTargetModelLiteral(id) {
+			t.Errorf("isTargetModelLiteral(%q) = false — a real identifier was rejected", id)
+		}
+	}
+}

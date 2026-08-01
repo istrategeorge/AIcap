@@ -24,11 +24,26 @@ function renderInline(text) {
   let s = escapeHtml(text);
   s = s.replace(/`([^`]+)`/g, (_, code) => {
     codeSpans.push(code);
-    return `@@AICAP_CODE_${codeSpans.length - 1}@@`;
+    // The placeholder must contain no underscore. The italic rule
+    // matches a body of [^_]+, so a token like @@AICAP_CODE_0@@ could
+    // never sit inside emphasis — which is exactly the shape § 2(a)
+    // produces (`_found at \`file.go:12\`_`), and why every location
+    // suffix rendered with literal underscores around it.
+    return `@@AICAPCODE${codeSpans.length - 1}@@`;
   });
   s = s.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
-  s = s.replace(/(^|[\s(])_([^_]+)_(?=$|[\s).,;:])/g, '$1<em>$2</em>');
-  s = s.replace(/@@AICAP_CODE_(\d+)@@/g, (_, i) => `<code>${codeSpans[i]}</code>`);
+  // Italics. The boundary classes deliberately include the code-span
+  // placeholder delimiter (@) and the backtick, because emphasis in this
+  // document routinely wraps a run that ends in a code span — the § 2(a)
+  // location suffix is `_found at \`file.go:12\`_`. Without that, the
+  // closing underscore sat against a placeholder rather than whitespace,
+  // the rule did not fire, and every one of those suffixes reached the
+  // reader as literal underscores.
+  //
+  // The `[^_]+` body still prevents a match from spanning snake_case
+  // identifiers, which is what the boundary was guarding against.
+  s = s.replace(/(^|[\s(`@])_([^_]+)_(?=$|[\s).,;:`@])/g, '$1<em>$2</em>');
+  s = s.replace(/@@AICAPCODE(\d+)@@/g, (_, i) => `<code>${codeSpans[i]}</code>`);
   return s;
 }
 

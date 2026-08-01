@@ -7,7 +7,7 @@
 #                      locally without cloud sync.
 #
 # Optional Repository Variables:
-#   AICAP_VERSION         — pin a specific release tag (default: v1.7.2).
+#   AICAP_VERSION         — pin a specific release tag (default: v1.7.3).
 #   AICAP_OSV_DISABLED    — "true" to skip OSV.dev CVE/GHSA enrichment.
 #
 # Copy this file into your repo as `bitbucket-pipelines.yml` and adjust
@@ -21,7 +21,7 @@ definitions:
         name: AIcap Compliance Scan
         script:
           - apk add --no-cache curl ca-certificates
-          - AICAP_VERSION="${AICAP_VERSION:-v1.7.2}"
+          - AICAP_VERSION="${AICAP_VERSION:-v1.7.3}"
           - >
             curl -fsSL
             "https://github.com/aicaplabs/AIcap/releases/download/${AICAP_VERSION}/aicap-linux-amd64"
@@ -33,7 +33,7 @@ definitions:
         name: AIcap CycloneDX SBOM
         script:
           - apk add --no-cache curl ca-certificates
-          - AICAP_VERSION="${AICAP_VERSION:-v1.7.2}"
+          - AICAP_VERSION="${AICAP_VERSION:-v1.7.3}"
           - >
             curl -fsSL
             "https://github.com/aicaplabs/AIcap/releases/download/${AICAP_VERSION}/aicap-linux-amd64"

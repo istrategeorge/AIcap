@@ -9,6 +9,35 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Trial of new features lands on `development` first. Once a stable
 batch is ready, it is merged to `main` and tagged.
 
+## [1.7.3] — 2026-08-01 — Emphasis rendering, punctuated false positives, count consistency
+
+Three defects from a full read of a v1.7.2 report.
+
+### Fixed
+
+- **Emphasis containing a code span never rendered.** The § 2(a)
+  location suffix is `_found at ` + "`file.go:12`" + `_`. Code spans are
+  lifted out before the italic pass and replaced by a placeholder — and
+  that placeholder contained underscores, so the italic body could never
+  span it. Every location suffix in a real report, around 47 of them,
+  reached the reader with literal underscores around it.
+
+- **A punctuated fragment was detected as a model identifier.** The
+  literal `(vgpt-5)`, lifted from one of this repository's own test
+  assertions, became a component rendered as
+  `Hardcoded Model ((vgpt-5))`. The existing guard rejected literals
+  containing whitespace, and this fragment has none. A model identifier
+  is now required to be a token — alphanumerics plus `-._/:` — which
+  also excludes `model=gpt-4` from a query string and `gpt-4-%s` from a
+  format string.
+
+- **Three sections disagreed on the component count.** § 1 reported 87,
+  § 2(a) rendered 47 entries after the v1.7.2 grouping, and § 2(b) used
+  87 as its denominator. A reader who counted the entries was forty
+  short of the headline. All three now derive from one identity
+  function, and § 1 reports "N distinct (M total detections across all
+  files)" — both facts, with neither implying the other.
+
 ## [1.7.2] — 2026-07-24 — Deterministic scans, grouped findings, honest policy status
 
 Found by reading a complete generated report end to end. The third such
