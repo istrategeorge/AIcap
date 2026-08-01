@@ -83,7 +83,22 @@ func GenerateAnnexIVMarkdownWithOptions(bom types.AIBOM, register types.RiskRegi
 	sb.WriteString(fmt.Sprintf("- **System Name:** %s\n", bom.ProjectName))
 	sb.WriteString(fmt.Sprintf("- **Version / Commit SHA:** `%s`\n", bom.CommitSha))
 	sb.WriteString(fmt.Sprintf("- **Total Files Scanned:** %d\n", bom.ScannedFiles))
-	sb.WriteString(fmt.Sprintf("- **AI Components Detected:** %d\n", len(bom.Dependencies)))
+	// Distinct components, with the raw detection count beside it.
+	//
+	// § 2(a) groups repeated detections into one entry per component, so
+	// reporting only len(bom.Dependencies) here left the headline count
+	// forty higher than the number of entries a reader can actually
+	// count in the section below it. Two numbers that disagree in a
+	// compliance document invite the reader to distrust both, and the
+	// distinct-component figure is the one that answers "how much AI is
+	// in this system".
+	distinct := countDistinctComponents(bom.Dependencies)
+	if distinct == len(bom.Dependencies) {
+		sb.WriteString(fmt.Sprintf("- **AI Components Detected:** %d\n", distinct))
+	} else {
+		sb.WriteString(fmt.Sprintf("- **AI Components Detected:** %d distinct (%d total detections across all files)\n",
+			distinct, len(bom.Dependencies)))
+	}
 	if bom.Policy != nil && bom.Policy.Purpose != "" {
 		sb.WriteString(fmt.Sprintf("- **Intended Purpose:** %s\n", bom.Policy.Purpose))
 	} else {
@@ -173,11 +188,22 @@ func GenerateAnnexIVMarkdownWithOptions(bom types.AIBOM, register types.RiskRegi
 	}
 
 	// 2(b): Licensing Summary (auto-generated)
+	//
+	// Counted over distinct components, matching § 1 and the entries
+	// § 2(a) renders. Counting raw detection sites made "62 / 87" a
+	// statement about occurrences rather than components, which is not
+	// what a licensing summary is asked for.
 	sb.WriteString("### 2(b) Licensing Compliance Summary\n")
 	licensedCount := 0
 	unlicensedHighRisk := 0
 	licenseTypes := map[string]int{}
+	seenComponent := map[string]bool{}
 	for _, dep := range bom.Dependencies {
+		key := componentIdentity(dep)
+		if seenComponent[key] {
+			continue
+		}
+		seenComponent[key] = true
 		if dep.License != "" {
 			licensedCount++
 			licenseTypes[dep.License]++
@@ -185,7 +211,7 @@ func GenerateAnnexIVMarkdownWithOptions(bom types.AIBOM, register types.RiskRegi
 			unlicensedHighRisk++
 		}
 	}
-	sb.WriteString(fmt.Sprintf("- **Components with license data:** %d / %d\n", licensedCount, len(bom.Dependencies)))
+	sb.WriteString(fmt.Sprintf("- **Components with license data:** %d / %d\n", licensedCount, len(seenComponent)))
 	sb.WriteString(fmt.Sprintf("- **High-risk components missing license:** %d\n", unlicensedHighRisk))
 	if len(licenseTypes) > 0 {
 		sb.WriteString("- **License distribution:**\n")
@@ -826,6 +852,30 @@ func cvssMethod(vector string) string {
 	default:
 		return "other"
 	}
+}
+
+// componentIdentity is the key that decides whether two detections are
+// the same component. Used by the § 1 count, the § 2(a) grouping, and
+// the § 2(b) licensing summary, so those three cannot disagree.
+//
+// Ecosystem is part of the identity because § 2(a) groups within an
+// ecosystem heading: the same package pinned in both requirements.txt
+// and pyproject.toml renders as two entries, under "Python (pip)" and
+// "Python (Poetry/PEP)". A count that collapsed them would be three
+// short of what the reader can count in the section below it, which is
+// the mismatch this identity exists to prevent.
+func componentIdentity(dep types.AIDependency) string {
+	return dep.Ecosystem + "|e|" + dep.Name + "|v|" + dep.Version + "|l|" + dep.License
+}
+
+// countDistinctComponents counts components after collapsing repeated
+// detections of the same one.
+func countDistinctComponents(deps []types.AIDependency) int {
+	seen := map[string]bool{}
+	for _, dep := range deps {
+		seen[componentIdentity(dep)] = true
+	}
+	return len(seen)
 }
 
 // depGroup is one distinct component and every place it was detected.

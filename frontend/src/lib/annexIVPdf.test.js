@@ -154,3 +154,36 @@ describe('markdownToHtml blockquotes', () => {
     expect(html).toContain('&lt;script&gt;');
   });
 });
+
+// Emphasis that ends in a code span.
+//
+// § 2(a) renders its location suffix as `_found at \`file.go:12\`_`, and
+// that shape did not render: the code-span placeholder inserted before
+// the italic pass contained underscores, so the italic body ([^_]+)
+// could never span it. Every one of ~47 location suffixes in a real
+// report reached the reader with literal underscores around it.
+describe('markdownToHtml emphasis around code spans', () => {
+  it('italicises a run that ends in a code span', () => {
+    const html = markdownToHtml('- **x** (v1.0): d — _found at `a.go:1`_');
+    expect(html).toContain('<em>found at <code>a.go:1</code></em>');
+    expect(html).not.toContain('_found at');
+  });
+
+  it('italicises a run containing several code spans', () => {
+    const html = markdownToHtml('- **x**: d — _3 occurrences, at `a.go`, `b.go`_');
+    expect(html).toContain('<em>3 occurrences, at <code>a.go</code>, <code>b.go</code></em>');
+  });
+
+  it('still leaves snake_case identifiers alone', () => {
+    expect(markdownToHtml('snake_case_identifier stays literal'))
+      .toContain('snake_case_identifier');
+    expect(markdownToHtml('snake_case_identifier stays literal'))
+      .not.toContain('<em>');
+  });
+
+  it('still renders underscores inside a code span verbatim', () => {
+    const html = markdownToHtml('code with `under_score` inside');
+    expect(html).toContain('<code>under_score</code>');
+    expect(html).not.toContain('<em>');
+  });
+});

@@ -898,3 +898,63 @@ func TestAnnexIV_Section3b_NoPolicyIsNotAPass(t *testing.T) {
 		t.Error("a policy that was evaluated cleanly should tick the box")
 	}
 }
+
+func TestAnnexIV_ComponentCountsAgreeAcrossSections(t *testing.T) {
+	// Three places state how many components there are: the § 1 headline,
+	// the § 2(a) entry list, and the § 2(b) licensing denominator. A real
+	// report had them at 87, 47 and 87 — a reader who counted the entries
+	// was forty short of the headline. Two numbers that disagree in a
+	// compliance document invite distrust of both.
+	bom := types.AIBOM{
+		ProjectName: "demo",
+		Dependencies: []types.AIDependency{
+			// Same component, three detection sites: one entry.
+			{Name: "openai", Version: "1.0", Ecosystem: "Python (pip)", RiskLevel: "High", Location: "a.txt"},
+			{Name: "openai", Version: "1.0", Ecosystem: "Python (pip)", RiskLevel: "High", Location: "b.txt"},
+			{Name: "openai", Version: "1.0", Ecosystem: "Python (pip)", RiskLevel: "High", Location: "c.txt"},
+			// Same package, different ecosystem heading: a separate entry,
+			// because § 2(a) renders it under its own section.
+			{Name: "openai", Version: "1.0", Ecosystem: "Python (Poetry/PEP)", RiskLevel: "High", Location: "pyproject.toml"},
+			// Distinct component.
+			{Name: "torch", Version: "2.4.0", Ecosystem: "Python (pip)", RiskLevel: "High", License: "apache-2.0"},
+		},
+	}
+
+	md := GenerateAnnexIVMarkdown(bom)
+
+	// Count the entries § 2(a) actually renders.
+	start := strings.Index(md, "### 2(a)")
+	end := strings.Index(md, "### 2(b)")
+	if start < 0 || end < 0 {
+		t.Fatal("could not locate § 2(a)")
+	}
+	rendered := 0
+	for _, line := range strings.Split(md[start:end], "\n") {
+		if strings.HasPrefix(line, "- **") {
+			rendered++
+		}
+	}
+	if rendered != 3 {
+		t.Fatalf("§ 2(a) rendered %d entries, want 3 distinct components", rendered)
+	}
+
+	// The § 1 headline must name that same number.
+	if !strings.Contains(md, "**AI Components Detected:** 3 distinct (5 total detections") {
+		line := ""
+		for _, l := range strings.Split(md, "\n") {
+			if strings.Contains(l, "AI Components Detected") {
+				line = l
+			}
+		}
+		t.Errorf("§ 1 count disagrees with the %d entries § 2(a) renders: %q", rendered, line)
+	}
+
+	// And the § 2(b) denominator must too.
+	if !strings.Contains(md, "**Components with license data:** 1 / 3") {
+		for _, l := range strings.Split(md, "\n") {
+			if strings.Contains(l, "Components with license data") {
+				t.Errorf("§ 2(b) denominator disagrees with the other two sections: %q", l)
+			}
+		}
+	}
+}

@@ -654,6 +654,9 @@ func isTargetModelLiteral(val string) bool {
 	if strings.ContainsAny(val, " \t\r\n") {
 		return false
 	}
+	if !looksLikeModelIdentifier(val) {
+		return false
+	}
 	for _, model := range targetModels {
 		if strings.Contains(val, model) {
 			return true
@@ -661,6 +664,37 @@ func isTargetModelLiteral(val string) bool {
 	}
 	_, ok := matchModelFamily(val)
 	return ok
+}
+
+// modelIdentifierChars is the character set a real model identifier
+// uses: alphanumerics plus the separators that appear in published
+// names — "claude-opus-4-5", "meta-llama/Llama-4-Maverick-17B",
+// "models/llama-3-8b.gguf", "gpt-4o-2024-08-06".
+//
+// Anything else means the literal is a fragment of code or prose that
+// merely happens to contain a model name. The whitespace check above
+// catches the sentence case; this catches the rest — "(gpt-4)" from a
+// test assertion, "model=gpt-4" from a query string, "gpt-4-%s" from a
+// format string. AIcap's own report flagged the literal "(vgpt-5)",
+// lifted out of one of its test files, and rendered it as a component
+// called "Hardcoded Model ((vgpt-5))".
+//
+// A whitelist rather than a blocklist: the set of characters a model id
+// legitimately uses is small and stable, while the set of ways a name
+// can be embedded in code is not.
+func looksLikeModelIdentifier(val string) bool {
+	if val == "" {
+		return false
+	}
+	for _, r := range val {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		case r == '-', r == '.', r == '/', r == '_', r == ':':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // pythonScanContext parameterises the Python line scanner so the same
