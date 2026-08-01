@@ -9,6 +9,56 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Trial of new features lands on `development` first. Once a stable
 batch is ready, it is merged to `main` and tagged.
 
+## [1.7.2] — 2026-07-24 — Deterministic scans, grouped findings, honest policy status
+
+Found by reading a complete generated report end to end. The third such
+read, and the one that surfaced a defect with consequences beyond the
+document.
+
+### Fixed
+
+- **Scans were not deterministic.** Three loops iterated Go maps while
+  emitting findings, and Go randomises map iteration: the Dockerfile
+  pip-install match, the Dockerfile base-image match, and the GPU cost
+  lookup. The visible symptom was a report that reshuffled itself — an
+  image matching two catalog keys was labelled "NVIDIA Container
+  Registry Image" on one run and "PyTorch Container Image" on the next,
+  and a Terraform file naming two GPU families reported whichever the
+  runtime reached first, with its cost figures.
+
+  The real problem is that the AI-BOM is what `/api/save-proof` hashes
+  into the audit chain. Two scans of an unchanged tree therefore
+  produced two different `crypto_hash` values, so the chain could not
+  distinguish "the code changed" from "a map iterated differently" —
+  undercutting the guarantee the hosted ledger exists to provide. All
+  three loops now iterate in sorted order, and the GPU lookup takes the
+  longest matching prefix so overlapping catalog keys (`p4d`/`p4de`,
+  `g5`/`g5g`) resolve to the more specific entry.
+
+  Existing ledger entries remain valid and verify normally. A rescan of
+  an unchanged repository after this release will produce a different
+  hash than it did before, because the previous value depended on
+  iteration order.
+
+- **§ 2(a) printed one line per detection and omitted the location.** A
+  model identifier used in eight files produced eight identical
+  sentences, indistinguishable from one another because the field that
+  separated them — where each was found — was the one the section never
+  rendered. Now one entry per distinct component with an occurrence
+  count and the detection sites, capped at five with "and N more".
+
+- **§ 3(b) reported "no policy file" as a passed policy check.** The
+  line read "No policy violations detected (or no `.aicap.yml`
+  configured)" beside a ticked box, so a project with no governance
+  policy at all appeared to have satisfied one — in the section an
+  auditor reads to judge exactly that. The two cases are now distinct
+  and the absent-policy case is explicitly not a pass.
+
+- The dashboard's client-side renderer received the § 2(a) grouping and
+  the version-prefix fix. It is a hand-maintained mirror of the Go
+  template and had silently diverged for a third time; it now carries
+  parity tests.
+
 ## [1.7.1] — 2026-07-24 — Report defects found by reading a generated PDF
 
 Four defects in the produced document, none of which the test suite
