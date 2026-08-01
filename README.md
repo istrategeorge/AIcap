@@ -141,7 +141,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Run AIcap Compliance Scan
-        uses: aicaplabs/AIcap@v1.7.2
+        uses: aicaplabs/AIcap@v1.7.3
         with:
           api-key: ${{ secrets.AICAP_API_KEY }}
           scan-directory: '.'
