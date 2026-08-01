@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 
+	"aicap/pkg/compliance"
+	"aicap/pkg/scanner"
 	"aicap/pkg/types"
 )
 
@@ -274,6 +276,57 @@ func TestVersionReferencesAreConsistent(t *testing.T) {
 				t.Errorf("%s references %s but VERSION says %s — a user following this "+
 					"instruction installs the wrong release", path, got, want)
 			}
+		}
+	}
+}
+
+// TestAnnexIVIsByteStableAcrossScans is the end-to-end guard for the
+// determinism the ledger depends on.
+//
+// The BOM is what /api/save-proof hashes into the audit chain. If a scan
+// of an unchanged tree can produce a different byte sequence, then two
+// runs yield two crypto_hashes and the chain cannot distinguish "the
+// code changed" from "a map iterated differently" — which is the whole
+// claim the paid tier rests on. It also meant the generated Annex IV
+// reshuffled its own sections between runs.
+//
+// Three separate map-range loops caused it: the Dockerfile pip-install
+// match, the Dockerfile base-image match, and the GPU cost lookup. The
+// per-package tests cover each; this one covers the property they exist
+// to protect.
+func TestAnnexIVIsByteStableAcrossScans(t *testing.T) {
+	dir := t.TempDir()
+	files := map[string]string{
+		"Dockerfile":       "FROM nvcr.io/nvidia/pytorch:24.01-py3\nRUN pip install openai langchain torch transformers\n",
+		"requirements.txt": "openai==1.40.0\ntorch==2.4.0\nlangchain==0.2.0\n",
+		"main.tf":          "resource \"aws_instance\" \"a\" {\n  instance_type = \"p4d.24xlarge\"\n}\nresource \"aws_instance\" \"b\" {\n  instance_type = \"g5.xlarge\"\n}\n",
+		"app.py":           "import openai\nMODEL = \"gpt-5\"\n",
+	}
+	for name, body := range files {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+
+	// Drop the two lines that legitimately differ between runs.
+	render := func() string {
+		bom := scanner.PerformScan(dir)
+		md := compliance.GenerateAnnexIVMarkdown(bom)
+		var kept []string
+		for _, line := range strings.Split(md, "\n") {
+			if strings.HasPrefix(line, "*Generated:") || strings.Contains(line, "Scan Timestamp") {
+				continue
+			}
+			kept = append(kept, line)
+		}
+		return strings.Join(kept, "\n")
+	}
+
+	first := render()
+	for i := 0; i < 10; i++ {
+		if got := render(); got != first {
+			t.Fatal("Annex IV differs between scans of an identical tree — " +
+				"the ledger hash computed over this BOM would differ too")
 		}
 	}
 }

@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -53,7 +54,9 @@ type catalogMeta struct {
 }
 
 // catalog is loaded once at process start.
-//   catalog[cloud][prefix] -> entry
+//
+//	catalog[cloud][prefix] -> entry
+//
 // Cloud key is lower-case ("aws", "azure", "gcp") for case-insensitive
 // matching against IaC content (which we also lower-case before lookup).
 var (
@@ -168,31 +171,64 @@ func SpotMultiplier(cloud string) float64 {
 // a GPU but don't know the instance type" case (typical for k8s
 // nvidia.com/gpu requests with no node-affinity to an instance class).
 func LookupGPUCost(content string) *types.FinOpsCost {
-	for cloud, entries := range catalog {
-		for prefix, entry := range entries {
-			if strings.Contains(content, prefix) {
-				hours := float64(AssumedHoursPerMonth())
-				out := &types.FinOpsCost{
-					InstanceFamily: prefix,
-					Cloud:          cloudDisplay(cloud),
-					HourlyUSDLow:   entry.HourlyUSDLow,
-					HourlyUSDHigh:  entry.HourlyUSDHigh,
-					MonthlyUSDLow:  entry.HourlyUSDLow * hours,
-					MonthlyUSDHigh: entry.HourlyUSDHigh * hours,
-					Description:    entry.Description,
-				}
-				if mult := SpotMultiplier(cloud); mult > 0 {
-					out.SpotMultiplier = mult
-					out.SpotHourlyUSDLow = entry.HourlyUSDLow * mult
-					out.SpotHourlyUSDHigh = entry.HourlyUSDHigh * mult
-					out.SpotMonthlyUSDLow = out.MonthlyUSDLow * mult
-					out.SpotMonthlyUSDHigh = out.MonthlyUSDHigh * mult
-				}
-				return out
+	// Iterated in sorted order, and the longest matching prefix wins.
+	//
+	// Ranging the catalog maps directly meant a file mentioning two GPU
+	// families got a randomly chosen one — so the same Terraform config
+	// reported a p4d on one run and a g5 on the next, with the cost
+	// figures to match. Nondeterminism anywhere in the scan also
+	// propagates into the ledger hash, which is computed over the BOM.
+	//
+	// Longest-prefix wins because the catalog contains overlapping keys
+	// ("g5" and "g5g", "p4d" and "p4de"); the more specific one is the
+	// better answer, and picking it by length is stable.
+	clouds := make([]string, 0, len(catalog))
+	for cloud := range catalog {
+		clouds = append(clouds, cloud)
+	}
+	sort.Strings(clouds)
+
+	bestCloud, bestPrefix := "", ""
+	var bestEntry catalogEntry
+	for _, cloud := range clouds {
+		entries := catalog[cloud]
+		prefixes := make([]string, 0, len(entries))
+		for p := range entries {
+			prefixes = append(prefixes, p)
+		}
+		sort.Strings(prefixes)
+		for _, prefix := range prefixes {
+			if !strings.Contains(content, prefix) {
+				continue
+			}
+			if len(prefix) > len(bestPrefix) {
+				bestCloud, bestPrefix, bestEntry = cloud, prefix, entries[prefix]
 			}
 		}
 	}
-	return nil
+	if bestPrefix == "" {
+		return nil
+	}
+
+	cloud, prefix, entry := bestCloud, bestPrefix, bestEntry
+	hours := float64(AssumedHoursPerMonth())
+	out := &types.FinOpsCost{
+		InstanceFamily: prefix,
+		Cloud:          cloudDisplay(cloud),
+		HourlyUSDLow:   entry.HourlyUSDLow,
+		HourlyUSDHigh:  entry.HourlyUSDHigh,
+		MonthlyUSDLow:  entry.HourlyUSDLow * hours,
+		MonthlyUSDHigh: entry.HourlyUSDHigh * hours,
+		Description:    entry.Description,
+	}
+	if mult := SpotMultiplier(cloud); mult > 0 {
+		out.SpotMultiplier = mult
+		out.SpotHourlyUSDLow = entry.HourlyUSDLow * mult
+		out.SpotHourlyUSDHigh = entry.HourlyUSDHigh * mult
+		out.SpotMonthlyUSDLow = out.MonthlyUSDLow * mult
+		out.SpotMonthlyUSDHigh = out.MonthlyUSDHigh * mult
+	}
+	return out
 }
 
 // cloudDisplay turns the lower-case catalog key ("aws", "azure", "gcp")
