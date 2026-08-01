@@ -74,3 +74,67 @@ describe('buildAnnexIVMarkdown § 2(c)', () => {
     expect(md).toContain('No specific hardware constraints');
   });
 });
+
+// § 2(a) parity with the Go renderer (pkg/compliance/compliance.go).
+//
+// This mirror has silently diverged from the backend three times now —
+// the FinOps split, the "v" prefix, and the § 2(a) grouping all shipped
+// to the CLI and the ledger while the dashboard kept rendering the old
+// form. These assertions encode the shape the Go renderer produces, so a
+// future change made on one side and not the other fails here.
+describe('buildAnnexIVMarkdown § 2(a) parity', () => {
+  const base = {
+    projectName: 'demo', commitSha: 'abc', complianceStatus: 'Passed',
+    finOps: [], finOpsCostEstimate: null,
+  };
+
+  it('prefixes "v" only on real versions', () => {
+    const md = buildAnnexIVMarkdown({
+      ...base,
+      dependencies: [
+        { name: 'openai', version: '1.12.0', ecosystem: 'Python (pip)', riskLevel: 'High', description: 'x' },
+        { name: 'Hardcoded Model', version: 'gpt-5', ecosystem: 'Source Code (.go)', riskLevel: 'High', description: 'y' },
+        { name: 'torch', version: '>=2.0', ecosystem: 'Python (pip)', riskLevel: 'High', description: 'z' },
+        { name: 'transformers', version: 'imported', ecosystem: 'Python (pip)', riskLevel: 'High', description: 'w' },
+      ],
+    }, null);
+
+    expect(md).toContain('(v1.12.0)');
+    expect(md).toContain('(gpt-5)');
+    expect(md).toContain('(>=2.0)');
+    expect(md).toContain('(imported)');
+    // The bug the dashboard shipped with.
+    expect(md).not.toContain('(vgpt-5)');
+    expect(md).not.toContain('(v>=2.0)');
+    expect(md).not.toContain('(vimported)');
+  });
+
+  it('collapses repeated detections and names where they were found', () => {
+    const md = buildAnnexIVMarkdown({
+      ...base,
+      dependencies: [
+        { name: 'Hardcoded Model', version: 'gpt-5', ecosystem: 'Source Code (.go)', riskLevel: 'High', description: 'y', location: 'a.go:1' },
+        { name: 'Hardcoded Model', version: 'gpt-5', ecosystem: 'Source Code (.go)', riskLevel: 'High', description: 'y', location: 'b.go:2' },
+        { name: 'Hardcoded Model', version: 'gpt-5', ecosystem: 'Source Code (.go)', riskLevel: 'High', description: 'y', location: 'a.go:1' },
+      ],
+    }, null);
+
+    // One line, not three.
+    expect((md.match(/\*\*Hardcoded Model\*\*/g) || []).length).toBe(1);
+    // Duplicate locations collapse: two distinct sites, not three.
+    expect(md).toContain('2 occurrences');
+    expect(md).toContain('a.go:1');
+    expect(md).toContain('b.go:2');
+  });
+
+  it('says "found at" for a single occurrence', () => {
+    const md = buildAnnexIVMarkdown({
+      ...base,
+      dependencies: [
+        { name: 'openai', version: '1.0.0', ecosystem: 'Python (pip)', riskLevel: 'High', description: 'x', location: 'req.txt' },
+      ],
+    }, null);
+    expect(md).toContain('found at');
+    expect(md).not.toContain('occurrences');
+  });
+});

@@ -22,11 +22,11 @@
 #                     unauthenticated against the SaaS).
 #
 # Optional CI/CD Variables:
-#   AICAP_VERSION   — pin a specific release tag (default: v1.7.1).
+#   AICAP_VERSION   — pin a specific release tag (default: v1.7.2).
 #   AICAP_OSV_DISABLED — set to "true" to skip OSV.dev CVE/GHSA enrichment.
 
 variables:
-  AICAP_VERSION: "v1.7.1"
+  AICAP_VERSION: "v1.7.2"
 
 # Reusable base — extend this for custom jobs (e.g. nightly full scans).
 .aicap-base:

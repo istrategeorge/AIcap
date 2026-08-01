@@ -1405,3 +1405,43 @@ func TestAnnexIV_Section1_Wave12Fields_PlaceholdersWhenAbsent(t *testing.T) {
 		}
 	}
 }
+
+// TestPerformScan_DependencyOrderIsStable pins that two scans of the
+// same tree produce the dependency list in the same order.
+//
+// This is not cosmetic. The BOM is what the ledger hashes, so an
+// unstable order means two scans of an identical tree produce different
+// crypto_hashes — a chain then cannot distinguish "the code changed"
+// from "a map iterated differently", and the rendered Annex IV
+// reshuffles itself between runs.
+//
+// The cause was ranging targetAILibraries directly when matching pip
+// installs in a Dockerfile; Go randomises map iteration.
+func TestPerformScan_DependencyOrderIsStable(t *testing.T) {
+	dir := createTempDir(t, map[string]string{
+		"Dockerfile":       "FROM python:3.11\nRUN pip install openai langchain torch transformers anthropic\n",
+		"requirements.txt": "openai==1.40.0\ntorch==2.4.0\n",
+		"app.py":           "import openai\nMODEL = \"gpt-5\"\n",
+	})
+
+	fingerprint := func() string {
+		bom := PerformScan(dir)
+		var sb strings.Builder
+		for _, d := range bom.Dependencies {
+			sb.WriteString(d.Name)
+			sb.WriteString("|")
+			sb.WriteString(d.Version)
+			sb.WriteString("|")
+			sb.WriteString(d.Location)
+			sb.WriteString("\n")
+		}
+		return sb.String()
+	}
+
+	first := fingerprint()
+	for i := 0; i < 12; i++ {
+		if got := fingerprint(); got != first {
+			t.Fatalf("dependency order varied between scans of an identical tree\nfirst:\n%s\ngot:\n%s", first, got)
+		}
+	}
+}

@@ -124,19 +124,49 @@ func GenerateAnnexIVMarkdownWithOptions(bom types.AIBOM, register types.RiskRegi
 	if len(bom.Dependencies) == 0 {
 		sb.WriteString("No AI dependencies detected.\n\n")
 	} else {
-		// Group dependencies by ecosystem for clarity
+		// Group by ecosystem, then collapse identical components within
+		// each group and report where they were found.
+		//
+		// The same component is legitimately detected many times — one
+		// hardcoded model identifier used in eight files produced eight
+		// identical lines. Because this section never rendered the
+		// Location field, those lines were literally indistinguishable:
+		// eight copies of the same sentence, conveying nothing beyond
+		// the first. The information that made them distinct — *where* —
+		// was the one thing omitted, and it is precisely what an auditor
+		// checking a finding needs.
+		//
+		// So: one line per distinct component, with the occurrence count
+		// and the locations. Same facts, a fraction of the page, and
+		// actually actionable.
 		ecosystems := map[string][]types.AIDependency{}
 		for _, dep := range bom.Dependencies {
 			ecosystems[dep.Ecosystem] = append(ecosystems[dep.Ecosystem], dep)
 		}
-		for ecosystem, deps := range ecosystems {
+		// Sorted: a map range gave the sections a different order on
+		// every run, so two scans of an unchanged repo produced
+		// documents that differed only by shuffling.
+		ecosystemNames := make([]string, 0, len(ecosystems))
+		for name := range ecosystems {
+			ecosystemNames = append(ecosystemNames, name)
+		}
+		sort.Strings(ecosystemNames)
+
+		for _, ecosystem := range ecosystemNames {
 			sb.WriteString(fmt.Sprintf("\n**%s:**\n", ecosystem))
-			for _, dep := range deps {
+			for _, g := range groupDependencies(ecosystems[ecosystem]) {
 				licenseText := ""
-				if dep.License != "" {
-					licenseText = fmt.Sprintf(" [License: %s]", dep.License)
+				if g.dep.License != "" {
+					licenseText = fmt.Sprintf(" [License: %s]", g.dep.License)
 				}
-				sb.WriteString(fmt.Sprintf("- **%s** (%s)%s: %s (Risk: %s)\n", dep.Name, DisplayVersion(dep.Version), licenseText, dep.Description, dep.RiskLevel))
+				sb.WriteString(fmt.Sprintf("- **%s** (%s)%s: %s (Risk: %s)",
+					g.dep.Name, DisplayVersion(g.dep.Version), licenseText,
+					g.dep.Description, g.dep.RiskLevel))
+				if loc := formatLocations(g.locations); loc != "" {
+					sb.WriteString(" — ")
+					sb.WriteString(loc)
+				}
+				sb.WriteString("\n")
 			}
 		}
 		sb.WriteString("\n")
@@ -159,8 +189,15 @@ func GenerateAnnexIVMarkdownWithOptions(bom types.AIBOM, register types.RiskRegi
 	sb.WriteString(fmt.Sprintf("- **High-risk components missing license:** %d\n", unlicensedHighRisk))
 	if len(licenseTypes) > 0 {
 		sb.WriteString("- **License distribution:**\n")
-		for lic, count := range licenseTypes {
-			sb.WriteString(fmt.Sprintf("  - %s: %d component(s)\n", lic, count))
+		// Sorted for the same reason § 2(a) is: a map range reordered
+		// this list on every run.
+		licNames := make([]string, 0, len(licenseTypes))
+		for lic := range licenseTypes {
+			licNames = append(licNames, lic)
+		}
+		sort.Strings(licNames)
+		for _, lic := range licNames {
+			sb.WriteString(fmt.Sprintf("  - %s: %d component(s)\n", lic, licenseTypes[lic]))
 		}
 	}
 	sb.WriteString("\n")
@@ -326,8 +363,18 @@ func GenerateAnnexIVMarkdownWithOptions(bom types.AIBOM, register types.RiskRegi
 	// 3(b): Policy compliance
 	sb.WriteString("### 3(b) Policy-as-Code Compliance\n")
 	if len(bom.PolicyViolations) == 0 {
-		sb.WriteString("- [x] No policy violations detected")
-		sb.WriteString(" (or no `.aicap.yml` policy file configured)\n\n")
+		// "No violations" and "no policy to violate" are different facts
+		// and must not share a tick. The original line said "No policy
+		// violations detected (or no .aicap.yml configured)" with a
+		// checked box, so a project with no governance policy at all
+		// read as having passed one.
+		if bom.Policy == nil {
+			sb.WriteString("- [ ] No `.aicap.yml` policy file was found, so no policy was evaluated. ")
+			sb.WriteString("This is not a pass: define a policy to enforce model governance ")
+			sb.WriteString("(blocked models, risk thresholds, licence restrictions) in CI.\n\n")
+		} else {
+			sb.WriteString("- [x] Policy evaluated against `.aicap.yml`; no violations detected.\n\n")
+		}
 	} else {
 		blockers := 0
 		warnings := 0
@@ -779,6 +826,77 @@ func cvssMethod(vector string) string {
 	default:
 		return "other"
 	}
+}
+
+// depGroup is one distinct component and every place it was detected.
+type depGroup struct {
+	dep       types.AIDependency
+	locations []string
+}
+
+// maxRenderedLocations caps how many detection sites are listed inline.
+// A model identifier used in forty files should say so and name a few,
+// not consume a page of the document.
+const maxRenderedLocations = 5
+
+// groupDependencies collapses repeated detections of the same component
+// into one entry carrying all of its locations.
+//
+// Identity is (name, version, licence): two hardcoded models differ by
+// the identifier they carry, which lives in Version, and two packages
+// differ by version. Locations are deduplicated too — the same file can
+// legitimately be walked twice when a directory scan and an image scan
+// both cover it.
+func groupDependencies(deps []types.AIDependency) []depGroup {
+	order := []string{}
+	byKey := map[string]*depGroup{}
+	seenLoc := map[string]bool{}
+
+	for _, dep := range deps {
+		key := dep.Name + "\x00" + dep.Version + "\x00" + dep.License
+		g, ok := byKey[key]
+		if !ok {
+			g = &depGroup{dep: dep}
+			byKey[key] = g
+			order = append(order, key)
+		}
+		if dep.Location != "" && !seenLoc[key+"\x00"+dep.Location] {
+			seenLoc[key+"\x00"+dep.Location] = true
+			g.locations = append(g.locations, dep.Location)
+		}
+	}
+
+	out := make([]depGroup, 0, len(order))
+	for _, key := range order {
+		g := byKey[key]
+		sort.Strings(g.locations)
+		out = append(out, *g)
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].dep.Name != out[j].dep.Name {
+			return out[i].dep.Name < out[j].dep.Name
+		}
+		return out[i].dep.Version < out[j].dep.Version
+	})
+	return out
+}
+
+// formatLocations renders the "found at" suffix for a grouped entry.
+func formatLocations(locations []string) string {
+	if len(locations) == 0 {
+		return ""
+	}
+	shown := locations
+	suffix := ""
+	if len(shown) > maxRenderedLocations {
+		shown = shown[:maxRenderedLocations]
+		suffix = fmt.Sprintf(" and %d more", len(locations)-maxRenderedLocations)
+	}
+	label := "found at"
+	if len(locations) > 1 {
+		label = fmt.Sprintf("%d occurrences, at", len(locations))
+	}
+	return fmt.Sprintf("_%s `%s`%s_", label, strings.Join(shown, "`, `"), suffix)
 }
 
 // DisplayVersion formats a version for human-facing output.

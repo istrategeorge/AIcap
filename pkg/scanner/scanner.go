@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -146,6 +147,34 @@ func matchModelFamily(val string) (modelFamily, bool) {
 		}
 	}
 	return modelFamily{}, false
+}
+
+// sortedKeys returns a map's keys in a stable order. Any loop that
+// emits a finding while ranging a map must use this: Go randomises map
+// iteration, and that randomness propagates into the BOM, the ledger
+// hash computed over it, and the rendered document.
+func sortedKeys(m map[string]string) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// sortedLibraryNames returns the AI-library catalog keys in a stable
+// order. Callers that emit a finding per catalog match must use this
+// rather than ranging the map: Go randomises map iteration, and any
+// randomness in the order findings are appended propagates into the
+// BOM, into the ledger hash computed over it, and into the rendered
+// document.
+func sortedLibraryNames() []string {
+	names := make([]string, 0, len(targetAILibraries))
+	for name := range targetAILibraries {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }
 
 // LookupLibrary returns the catalog metadata for a known AI library
@@ -1097,7 +1126,14 @@ func parseDockerfile(filePath string) []types.AIDependency {
 			imageParts := strings.Fields(line)
 			if len(imageParts) >= 2 {
 				imageName := strings.ToLower(imageParts[1])
-				for aiKey, aiDesc := range aiBaseImages {
+				// Sorted, and first match wins — so an image matching
+				// several keys (nvcr.io/nvidia/pytorch matches both
+				// "nvcr.io" and "pytorch") always gets the same
+				// description. Ranging the map made the label flip
+				// between runs, which meant the same Dockerfile produced
+				// a different document and a different ledger hash.
+				for _, aiKey := range sortedKeys(aiBaseImages) {
+					aiDesc := aiBaseImages[aiKey]
 					if strings.Contains(imageName, aiKey) {
 						found = append(found, types.AIDependency{
 							Name:        imageParts[1],
@@ -1131,9 +1167,19 @@ func parseDockerfile(filePath string) []types.AIDependency {
 			}
 		}
 
-		// Detect pip install of AI libraries within Dockerfile RUN commands
+		// Detect pip install of AI libraries within Dockerfile RUN commands.
+		//
+		// Iterated in sorted order, not map order. Go randomises map
+		// iteration, so ranging the catalog directly emitted these
+		// findings in a different sequence on every run — which made the
+		// BOM's dependency order vary, and the BOM is what the ledger
+		// hashes. Two scans of an identical tree produced different
+		// crypto_hashes, so a chain could not distinguish "the code
+		// changed" from "the map iterated differently", and the
+		// generated document reshuffled itself between runs.
 		if strings.HasPrefix(lineLower, "run ") && strings.Contains(lineLower, "pip install") {
-			for libName, meta := range targetAILibraries {
+			for _, libName := range sortedLibraryNames() {
+				meta := targetAILibraries[libName]
 				if strings.Contains(lineLower, libName) {
 					found = append(found, types.AIDependency{
 						Name:        libName,

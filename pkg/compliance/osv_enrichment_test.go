@@ -805,3 +805,96 @@ func TestComputeRiskRegister_KeepsPlaceholderWhenItIsAllWeHave(t *testing.T) {
 		t.Fatalf("findings = %d, want the import-only finding retained", len(reg.Findings))
 	}
 }
+
+func TestAnnexIV_Section2a_GroupsAndLocatesDetections(t *testing.T) {
+	// The question a reader asks of a repeated finding is "where?", and
+	// § 2(a) used to answer by printing the same sentence N times with
+	// the location omitted.
+	bom := types.AIBOM{
+		ProjectName: "demo",
+		Dependencies: []types.AIDependency{
+			{Name: "Hardcoded Model", Version: "gpt-5", Ecosystem: "Source Code (.go)",
+				RiskLevel: "High", Description: "Hardcoded AI model identifier", Location: "b.go:2"},
+			{Name: "Hardcoded Model", Version: "gpt-5", Ecosystem: "Source Code (.go)",
+				RiskLevel: "High", Description: "Hardcoded AI model identifier", Location: "a.go:1"},
+			{Name: "Hardcoded Model", Version: "gpt-5", Ecosystem: "Source Code (.go)",
+				RiskLevel: "High", Description: "Hardcoded AI model identifier", Location: "a.go:1"},
+		},
+	}
+	md := GenerateAnnexIVMarkdown(bom)
+
+	if got := strings.Count(md, "**Hardcoded Model**"); got != 1 {
+		t.Errorf("component rendered %d times, want 1 grouped entry", got)
+	}
+	if !strings.Contains(md, "2 occurrences") {
+		t.Error("occurrence count missing — duplicate locations should collapse to two distinct sites")
+	}
+	for _, loc := range []string{"a.go:1", "b.go:2"} {
+		if !strings.Contains(md, loc) {
+			t.Errorf("location %q not rendered; without it duplicate findings are indistinguishable", loc)
+		}
+	}
+	if strings.Contains(md, "(vgpt-5)") {
+		t.Error("model identifier rendered with a stray v prefix")
+	}
+}
+
+func TestAnnexIV_IsDeterministicAcrossRuns(t *testing.T) {
+	// § 2(a) grouped by ranging a map and § 2(b) listed licences the
+	// same way, so two scans of an unchanged repo produced documents
+	// that differed only by section order.
+	bom := types.AIBOM{
+		ProjectName: "demo",
+		Dependencies: []types.AIDependency{
+			{Name: "openai", Version: "1.0", Ecosystem: "Python (pip)", RiskLevel: "High", License: "MIT"},
+			{Name: "torch", Version: "2.0", Ecosystem: "Python (Poetry lock)", RiskLevel: "High", License: "apache-2.0"},
+			{Name: "ai", Version: "4.0", Ecosystem: "Node.js (npm)", RiskLevel: "High", License: "MIT"},
+			{Name: "Hardcoded Model", Version: "gpt-5", Ecosystem: "Source Code (.go)", RiskLevel: "High"},
+		},
+	}
+
+	// Strip the generation timestamp, which legitimately differs.
+	normalise := func(s string) string {
+		out := []string{}
+		for _, line := range strings.Split(s, "\n") {
+			if strings.HasPrefix(line, "*Generated:") || strings.Contains(line, "Scan Timestamp") {
+				continue
+			}
+			out = append(out, line)
+		}
+		return strings.Join(out, "\n")
+	}
+
+	first := normalise(GenerateAnnexIVMarkdown(bom))
+	for i := 0; i < 15; i++ {
+		if got := normalise(GenerateAnnexIVMarkdown(bom)); got != first {
+			t.Fatal("Annex IV markdown varies between identical runs")
+		}
+	}
+}
+
+func TestAnnexIV_Section3b_NoPolicyIsNotAPass(t *testing.T) {
+	// "No violations detected" and "there was no policy to violate" are
+	// different facts. The section used to render both as one ticked
+	// box, so a project with no governance policy at all read as having
+	// passed one — in the document an auditor uses to judge exactly
+	// that.
+	noPolicy := GenerateAnnexIVMarkdown(types.AIBOM{ProjectName: "demo"})
+	if strings.Contains(noPolicy, "- [x] No policy violations") {
+		t.Error("a project with no .aicap.yml renders as a passed policy check")
+	}
+	if !strings.Contains(noPolicy, "no policy was evaluated") {
+		t.Error("the absence of a policy file must be stated plainly")
+	}
+	if !strings.Contains(noPolicy, "not a pass") {
+		t.Error("the section must say that an unevaluated policy is not a pass")
+	}
+
+	withPolicy := GenerateAnnexIVMarkdown(types.AIBOM{
+		ProjectName: "demo",
+		Policy:      &types.PolicyConfig{Purpose: "test"},
+	})
+	if !strings.Contains(withPolicy, "- [x] Policy evaluated") {
+		t.Error("a policy that was evaluated cleanly should tick the box")
+	}
+}

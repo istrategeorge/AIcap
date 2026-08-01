@@ -276,3 +276,40 @@ func TestLoadCatalogFromURL_Unreachable(t *testing.T) {
 		t.Error("embedded catalog broken after failed LoadCatalogFromURL")
 	}
 }
+
+// TestLookupGPUCost_IsDeterministic pins that a file mentioning several
+// GPU families always resolves to the same one.
+//
+// The lookup used to range the catalog maps directly, and Go randomises
+// map iteration — so a Terraform config with both a p4d and a g5
+// reported whichever the runtime happened to reach first, along with
+// its cost figures. That made the generated Annex IV differ between
+// runs, and since the ledger hashes the BOM, it made two scans of an
+// unchanged tree produce different chain hashes.
+func TestLookupGPUCost_IsDeterministic(t *testing.T) {
+	content := `resource "aws_instance" "a" { instance_type = "p4d.24xlarge" }
+resource "aws_instance" "b" { instance_type = "g5.xlarge" }
+resource "aws_instance" "c" { instance_type = "g4dn.xlarge" }`
+
+	first := LookupGPUCost(content)
+	if first == nil {
+		t.Fatal("no cost matched a content block naming three known families")
+	}
+	for i := 0; i < 25; i++ {
+		got := LookupGPUCost(content)
+		if got == nil || got.InstanceFamily != first.InstanceFamily || got.Cloud != first.Cloud {
+			t.Fatalf("lookup varied between calls: %+v vs %+v", first, got)
+		}
+	}
+}
+
+func TestLookupGPUCost_LongestPrefixWins(t *testing.T) {
+	// The catalog holds overlapping keys (p4d/p4de, g5/g5g). The more
+	// specific match is the better answer, and picking by length is
+	// stable where map order is not.
+	if got := LookupGPUCost(`instance_type = "p4de.24xlarge"`); got == nil {
+		t.Fatal("no match for p4de")
+	} else if got.InstanceFamily != "p4de." && got.InstanceFamily != "p4de" {
+		t.Errorf("InstanceFamily = %q, want the more specific p4de entry", got.InstanceFamily)
+	}
+}

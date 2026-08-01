@@ -31,14 +31,14 @@ var inferenceAlternative = map[string]struct {
 	Accelerator string // human-readable accelerator name
 	Note        string // short rationale fragment
 }{
-	"p3.":           {"aws", "g5.", "NVIDIA A10G", "successor inference family with newer GPU at a fraction of the cost"},
-	"p4d.":          {"aws", "inf2.", "AWS Inferentia2", "purpose-built inference silicon; A100-class throughput at a fraction of the cost"},
-	"p4de.":         {"aws", "inf2.", "AWS Inferentia2", "purpose-built inference silicon; A100 80GB workloads typically fit on inf2.xlarge–inf2.24xlarge"},
-	"p5.":           {"aws", "inf2.", "AWS Inferentia2", "H100 is over-provisioned for inference; Inferentia2 covers most LLM serving workloads"},
-	"trn1.":         {"aws", "inf2.", "AWS Inferentia2", "Trainium is training-only silicon; pair it with Inferentia2 for serving"},
-	"a3-highgpu":    {"gcp", "g2-standard", "NVIDIA L4", "L4 is GCP's inference-optimized GPU; H100 is over-provisioned for serving"},
-	"a2-highgpu":    {"gcp", "g2-standard", "NVIDIA L4", "L4 is GCP's inference-optimized GPU; A100 is training-class"},
-	"a2-megagpu":    {"gcp", "g2-standard", "NVIDIA L4", "L4 is GCP's inference-optimized GPU; A100 80GB is training-class"},
+	"p3.":        {"aws", "g5.", "NVIDIA A10G", "successor inference family with newer GPU at a fraction of the cost"},
+	"p4d.":       {"aws", "inf2.", "AWS Inferentia2", "purpose-built inference silicon; A100-class throughput at a fraction of the cost"},
+	"p4de.":      {"aws", "inf2.", "AWS Inferentia2", "purpose-built inference silicon; A100 80GB workloads typically fit on inf2.xlarge–inf2.24xlarge"},
+	"p5.":        {"aws", "inf2.", "AWS Inferentia2", "H100 is over-provisioned for inference; Inferentia2 covers most LLM serving workloads"},
+	"trn1.":      {"aws", "inf2.", "AWS Inferentia2", "Trainium is training-only silicon; pair it with Inferentia2 for serving"},
+	"a3-highgpu": {"gcp", "g2-standard", "NVIDIA L4", "L4 is GCP's inference-optimized GPU; H100 is over-provisioned for serving"},
+	"a2-highgpu": {"gcp", "g2-standard", "NVIDIA L4", "L4 is GCP's inference-optimized GPU; A100 is training-class"},
+	"a2-megagpu": {"gcp", "g2-standard", "NVIDIA L4", "L4 is GCP's inference-optimized GPU; A100 80GB is training-class"},
 }
 
 // HasTrainingSignals returns true when the BOM carries any evidence
