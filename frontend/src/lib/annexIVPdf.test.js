@@ -107,7 +107,8 @@ describe('buildPrintDocument', () => {
     expect(doc).toContain('<title>annex-iv-abcdef12</title>');
     expect(doc).toContain('Immutable ledger entry');
     expect(doc).toContain('abcdef1234567890');
-    expect(doc).toContain('Generated');
+    // "Exported", not "Generated" — see the footer-wording tests below.
+    expect(doc).toContain('Exported');
   });
 
   it('falls back to a slugged project name when there is no hash', () => {
@@ -185,5 +186,32 @@ describe('markdownToHtml emphasis around code spans', () => {
     const html = markdownToHtml('code with `under_score` inside');
     expect(html).toContain('<code>under_score</code>');
     expect(html).not.toContain('<em>');
+  });
+});
+
+// The footer date is an export timestamp, not a generation timestamp.
+//
+// The document body already carries its own "*Generated:*" line and, in
+// § 5, the scan timestamp — both from the scan. Labelling the footer
+// "Generated" too put two different dates under the same word in an
+// audit document, leaving a reader to guess which one was authoritative.
+describe('buildPrintDocument footer wording', () => {
+  it('labels the footer timestamp as an export, not a generation', () => {
+    const html = buildPrintDocument('# Doc', { hash: 'abc123def456' });
+    expect(html).toContain('Exported ');
+    expect(html).not.toMatch(/Generated \d{4}-\d{2}-\d{2}/);
+  });
+
+  it('still carries the ledger hash for traceability', () => {
+    const html = buildPrintDocument('# Doc', { hash: 'abc123def456' });
+    expect(html).toContain('Immutable ledger entry:');
+    expect(html).toContain('abc123def456');
+  });
+
+  it('does not disturb a "Generated:" line inside the document body', () => {
+    // The body's own generation stamp is a different fact and must survive.
+    const html = buildPrintDocument('*Generated: 2026-08-01T10:14:32Z*', {});
+    expect(html).toContain('2026-08-01T10:14:32Z');
+    expect(html).toContain('Exported ');
   });
 });

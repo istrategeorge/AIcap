@@ -10,4 +10,4 @@
 // a much older tag. A version string duplicated across six surfaces and
 // bumped by hand will eventually disagree with itself, and the surfaces
 // users actually read are the ones nobody remembers to check.
-export const AICAP_VERSION = 'v1.7.3';
+export const AICAP_VERSION = 'v1.7.4';

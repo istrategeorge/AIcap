@@ -280,14 +280,20 @@ const PRINT_CSS = `
 `;
 
 // Full standalone HTML document for the print iframe. The footer block
-// carries provenance (ledger hash, generation date) so a printed copy
+// carries provenance (ledger hash, export date) so a printed copy
 // remains traceable back to its immutable ledger entry.
 export function buildPrintDocument(markdown, { hash, projectName } = {}) {
   const body = markdownToHtml(markdown);
   const title = hash
     ? `annex-iv-${hash.substring(0, 8)}`
     : `annex-iv-${(projectName || 'report').toLowerCase().replace(/[^a-z0-9-]+/g, '-')}`;
-  const generated = new Date().toISOString().replace('T', ' ').substring(0, 16) + ' UTC';
+  // "Exported", not "Generated". This is the moment the PDF was printed,
+  // which is not when the document was produced — the body already
+  // carries its own "*Generated:*" line and § 5 its scan timestamp, both
+  // from the scan itself. Labelling this one "Generated" put two
+  // different dates under the same word in an audit document, leaving a
+  // reader to guess which was authoritative.
+  const exported = new Date().toISOString().replace('T', ' ').substring(0, 16) + ' UTC';
   const hashLine = hash
     ? `<p>Immutable ledger entry: <code>${escapeHtml(hash)}</code></p>`
     : '';
@@ -301,7 +307,7 @@ export function buildPrintDocument(markdown, { hash, projectName } = {}) {
 <body>
 ${body}
 <div class="doc-footer">
-${hashLine}<p>Generated ${generated} by AIcap — Continuous AI-BOM &amp; EU AI Act Compliance Scanner · https://aicap.dev</p>
+${hashLine}<p>Exported ${exported} by AIcap — Continuous AI-BOM &amp; EU AI Act Compliance Scanner · https://aicap.dev</p>
 </div>
 </body>
 </html>`;
