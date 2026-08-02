@@ -9,6 +9,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Trial of new features lands on `development` first. Once a stable
 batch is ready, it is merged to `main` and tagged.
 
+## [1.7.4] — 2026-08-02 — PDF footer says "Exported", not "Generated"
+
+### Fixed
+
+- The exported PDF's footer was labelled "Generated <timestamp>", using the
+  moment the PDF was printed. The document body already carries its own
+  "*Generated:*" line and, in § 5, the scan timestamp — both from the scan
+  itself. That put two different dates under the same word in an audit
+  document and left a reader to guess which was authoritative. The footer now
+  reads "Exported"; the ledger hash beside it is unchanged.
+
 ## [1.7.3] — 2026-08-01 — Emphasis rendering, punctuated false positives, count consistency
 
 Three defects from a full read of a v1.7.2 report.
